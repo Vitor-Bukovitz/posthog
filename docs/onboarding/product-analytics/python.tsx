@@ -1,13 +1,10 @@
-import { useMDXComponents } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+
 import { StepDefinition } from '../steps'
 
-export const getPythonSteps = (
-    CodeBlock: any,
-    Markdown: any,
-    CalloutBox: any,
-    dedent: any,
-    snippets: any
-): StepDefinition[] => {
+export const getPythonSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
+    const { CodeBlock, Markdown, CalloutBox, dedent, snippets } = ctx
+
     const PythonEventCapture = snippets?.PythonEventCapture
 
     return [
@@ -37,7 +34,7 @@ export const getPythonSteps = (
             content: (
                 <>
                     <Markdown>
-                        Initialize the PostHog client with your project API key and host from your project settings:
+                        Initialize the PostHog client with your project token and host from your project settings:
                     </Markdown>
                     <CodeBlock
                         blocks={[
@@ -48,7 +45,7 @@ export const getPythonSteps = (
                                     from posthog import Posthog
 
                                     posthog = Posthog(
-                                        project_api_key='<ph_project_api_key>',
+                                        project_api_key='<ph_project_token>',
                                         host='<ph_client_api_host>'
                                     )
                                 `,
@@ -80,17 +77,4 @@ export const getPythonSteps = (
     ]
 }
 
-export const PythonInstallation = (): JSX.Element => {
-    const { Steps, Step, CodeBlock, Markdown, CalloutBox, dedent, snippets } = useMDXComponents()
-    const steps = getPythonSteps(CodeBlock, Markdown, CalloutBox, dedent, snippets)
-
-    return (
-        <Steps>
-            {steps.map((step, index) => (
-                <Step key={index} title={step.title} badge={step.badge}>
-                    {step.content}
-                </Step>
-            ))}
-        </Steps>
-    )
-}
+export const PythonInstallation = createInstallation(getPythonSteps)

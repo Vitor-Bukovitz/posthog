@@ -1,7 +1,8 @@
 import { Counter } from 'prom-client'
 
 import { EventHeaders } from '../../types'
-import { EventIngestionRestrictionManager, Restriction } from '../../utils/event-ingestion-restriction-manager'
+import { EventIngestionRestrictionManager, RestrictionType } from '../../utils/event-ingestion-restrictions'
+import { OVERFLOW_OUTPUT, OverflowOutput } from '../common/outputs'
 import { dlq, drop, ok, redirect } from '../pipelines/results'
 import { ProcessingStep } from '../pipelines/steps'
 
@@ -11,7 +12,6 @@ export const ingestionOverflowingMessagesTotal = new Counter({
 })
 
 export type RoutingConfig = {
-    overflowTopic: string
     overflowEnabled: boolean
     preservePartitionLocality: boolean
 }
@@ -19,35 +19,34 @@ export type RoutingConfig = {
 export function createApplyEventRestrictionsStep<T extends { headers: EventHeaders }>(
     manager: EventIngestionRestrictionManager,
     routingConfig: RoutingConfig
-): ProcessingStep<T, T> {
+): ProcessingStep<T, T, OverflowOutput> {
     return async function applyEventRestrictionsStep(input) {
         const { headers } = input
-        const { token } = headers ?? {}
 
-        const restrictions = manager.getAppliedRestrictions(token, headers)
+        const restrictions = manager.getAppliedRestrictions(headers.token, headers)
 
         if (restrictions.size === 0) {
             return Promise.resolve(ok(input))
         }
 
         // Priority 1: Drop
-        if (restrictions.has(Restriction.DROP_EVENT)) {
+        if (restrictions.has(RestrictionType.DROP_EVENT)) {
             return drop('blocked_token')
         }
 
         // Priority 2: DLQ
-        if (restrictions.has(Restriction.REDIRECT_TO_DLQ)) {
+        if (restrictions.has(RestrictionType.REDIRECT_TO_DLQ)) {
             return dlq('restricted_to_dlq')
         }
 
         // Priority 3: Overflow
-        if (routingConfig.overflowEnabled && restrictions.has(Restriction.FORCE_OVERFLOW)) {
+        if (routingConfig.overflowEnabled && restrictions.has(RestrictionType.FORCE_OVERFLOW)) {
             ingestionOverflowingMessagesTotal.inc()
-            const shouldProcessPerson = !restrictions.has(Restriction.SKIP_PERSON_PROCESSING)
+            const shouldProcessPerson = !restrictions.has(RestrictionType.SKIP_PERSON_PROCESSING)
             const preservePartitionLocality = shouldProcessPerson ? true : routingConfig.preservePartitionLocality
             return redirect(
                 'Event redirected to overflow due to force overflow restrictions',
-                routingConfig.overflowTopic,
+                OVERFLOW_OUTPUT,
                 preservePartitionLocality,
                 false
             )

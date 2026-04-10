@@ -19,28 +19,25 @@
  */
 export type RoleAtOrganizationEnumApi = (typeof RoleAtOrganizationEnumApi)[keyof typeof RoleAtOrganizationEnumApi]
 
-// eslint-disable-next-line @typescript-eslint/no-redeclare
 export const RoleAtOrganizationEnumApi = {
-    engineering: 'engineering',
-    data: 'data',
-    product: 'product',
-    founder: 'founder',
-    leadership: 'leadership',
-    marketing: 'marketing',
-    sales: 'sales',
-    other: 'other',
+    Engineering: 'engineering',
+    Data: 'data',
+    Product: 'product',
+    Founder: 'founder',
+    Leadership: 'leadership',
+    Marketing: 'marketing',
+    Sales: 'sales',
+    Other: 'other',
 } as const
 
 export type BlankEnumApi = (typeof BlankEnumApi)[keyof typeof BlankEnumApi]
 
-// eslint-disable-next-line @typescript-eslint/no-redeclare
 export const BlankEnumApi = {
     '': '',
 } as const
 
 export type NullEnumApi = (typeof NullEnumApi)[keyof typeof NullEnumApi]
 
-// eslint-disable-next-line @typescript-eslint/no-redeclare
 export const NullEnumApi = {} as const
 
 /**
@@ -66,7 +63,7 @@ export interface UserBasicApi {
     is_email_verified?: boolean | null
     /** @nullable */
     readonly hedgehog_config: UserBasicApiHedgehogConfig
-    role_at_organization?: RoleAtOrganizationEnumApi | BlankEnumApi | NullEnumApi
+    role_at_organization?: RoleAtOrganizationEnumApi | BlankEnumApi | NullEnumApi | null
 }
 
 /**
@@ -76,13 +73,12 @@ export interface UserBasicApi {
 export type SessionRecordingPlaylistTypeEnumApi =
     (typeof SessionRecordingPlaylistTypeEnumApi)[keyof typeof SessionRecordingPlaylistTypeEnumApi]
 
-// eslint-disable-next-line @typescript-eslint/no-redeclare
 export const SessionRecordingPlaylistTypeEnumApi = {
-    collection: 'collection',
-    filters: 'filters',
+    Collection: 'collection',
+    Filters: 'filters',
 } as const
 
-export type SessionRecordingPlaylistApiRecordingsCounts = { [key: string]: { [key: string]: number | boolean } }
+export type SessionRecordingPlaylistApiRecordingsCounts = { [key: string]: { [key: string]: number | boolean | null } }
 
 export interface SessionRecordingPlaylistApi {
     readonly id: number
@@ -106,7 +102,7 @@ export interface SessionRecordingPlaylistApi {
     readonly last_modified_at: string
     readonly last_modified_by: UserBasicApi
     readonly recordings_counts: SessionRecordingPlaylistApiRecordingsCounts
-    readonly type: SessionRecordingPlaylistTypeEnumApi | NullEnumApi
+    readonly type: SessionRecordingPlaylistTypeEnumApi | NullEnumApi | null
     /** Return whether this is a synthetic playlist */
     readonly is_synthetic: boolean
     _create_in_folder?: string
@@ -121,7 +117,9 @@ export interface PaginatedSessionRecordingPlaylistListApi {
     results: SessionRecordingPlaylistApi[]
 }
 
-export type PatchedSessionRecordingPlaylistApiRecordingsCounts = { [key: string]: { [key: string]: number | boolean } }
+export type PatchedSessionRecordingPlaylistApiRecordingsCounts = {
+    [key: string]: { [key: string]: number | boolean | null }
+}
 
 export interface PatchedSessionRecordingPlaylistApi {
     readonly id?: number
@@ -145,19 +143,43 @@ export interface PatchedSessionRecordingPlaylistApi {
     readonly last_modified_at?: string
     readonly last_modified_by?: UserBasicApi
     readonly recordings_counts?: PatchedSessionRecordingPlaylistApiRecordingsCounts
-    readonly type?: SessionRecordingPlaylistTypeEnumApi | NullEnumApi
+    readonly type?: SessionRecordingPlaylistTypeEnumApi | NullEnumApi | null
     /** Return whether this is a synthetic playlist */
     readonly is_synthetic?: boolean
     _create_in_folder?: string
 }
 
 export interface MinimalPersonApi {
+    /** Numeric person ID. */
     readonly id: number
+    /** Display name derived from person properties (email, name, or username). */
     readonly name: string
-    readonly distinct_ids: string
+    readonly distinct_ids: readonly string[]
+    /** Key-value map of person properties set via $set and $set_once operations. */
     properties?: unknown
+    /** When this person was first seen (ISO 8601). */
     readonly created_at: string
+    /** Unique identifier (UUID) for this person. */
     readonly uuid: string
+    /**
+     * Timestamp of the last event from this person, or null.
+     * @nullable
+     */
+    readonly last_seen_at: string | null
+}
+
+/**
+ * Initial goal and session outcome coming from LLM.
+ */
+export interface OutcomeApi {
+    /**
+     * @minLength 1
+     * @maxLength 10000
+     * @nullable
+     */
+    description?: string | null
+    /** @nullable */
+    success?: boolean | null
 }
 
 export type SessionRecordingApiExternalReferencesItem = { [key: string]: unknown }
@@ -203,6 +225,8 @@ export interface SessionRecordingApi {
     readonly ongoing: boolean
     /** @nullable */
     readonly activity_score: number | null
+    readonly has_summary: boolean
+    readonly summary_outcome: OutcomeApi | null
     /** Load external references (linked issues) for this recording */
     readonly external_references: readonly SessionRecordingApiExternalReferencesItem[]
 }
@@ -259,32 +283,10 @@ export interface PatchedSessionRecordingApi {
     readonly ongoing?: boolean
     /** @nullable */
     readonly activity_score?: number | null
+    readonly has_summary?: boolean
+    readonly summary_outcome?: OutcomeApi | null
     /** Load external references (linked issues) for this recording */
     readonly external_references?: readonly PatchedSessionRecordingApiExternalReferencesItem[]
-}
-
-export type EnvironmentsSessionRecordingPlaylistsListParams = {
-    created_by?: number
-    /**
-     * Number of results to return per page.
-     */
-    limit?: number
-    /**
-     * The initial index from which to return the results.
-     */
-    offset?: number
-    short_id?: string
-}
-
-export type EnvironmentsSessionRecordingsListParams = {
-    /**
-     * Number of results to return per page.
-     */
-    limit?: number
-    /**
-     * The initial index from which to return the results.
-     */
-    offset?: number
 }
 
 export type SessionRecordingPlaylistsListParams = {

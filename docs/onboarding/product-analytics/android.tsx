@@ -1,8 +1,10 @@
-import { useMDXComponents } from 'scenes/onboarding/OnboardingDocsContentWrapper'
-import { PersonProfiles } from './_snippets/person-profiles'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+
 import { StepDefinition } from '../steps'
 
-export const getAndroidSteps = (CodeBlock: any, Markdown: any, dedent: any): StepDefinition[] => {
+export const getAndroidSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
+    const { CodeBlock, Markdown, dedent } = ctx
+
     return [
         {
             title: 'Install the dependency',
@@ -41,16 +43,16 @@ export const getAndroidSteps = (CodeBlock: any, Markdown: any, dedent: any): Ste
                                     class SampleApp : Application() {
 
                                         companion object {
-                                            const val POSTHOG_API_KEY = "<ph_project_api_key>"
+                                            const val POSTHOG_PROJECT_TOKEN = "<ph_project_token>"
                                             const val POSTHOG_HOST = "<ph_client_api_host>"
                                         }
 
                                         override fun onCreate() {
                                             super.onCreate()
 
-                                            // Create a PostHog Config with the given API key and host
+                                            // Create a PostHog Config with the given project token and host
                                             val config = PostHogAndroidConfig(
-                                                apiKey = POSTHOG_API_KEY,
+                                                apiKey = POSTHOG_PROJECT_TOKEN,
                                                 host = POSTHOG_HOST
                                             )
 
@@ -92,24 +94,10 @@ export const getAndroidSteps = (CodeBlock: any, Markdown: any, dedent: any): Ste
                             },
                         ]}
                     />
-                    <PersonProfiles language="kotlin" />
                 </>
             ),
         },
     ]
 }
 
-export const AndroidInstallation = (): JSX.Element => {
-    const { Steps, Step, CodeBlock, Markdown, dedent } = useMDXComponents()
-    const steps = getAndroidSteps(CodeBlock, Markdown, dedent)
-
-    return (
-        <Steps>
-            {steps.map((step, index) => (
-                <Step key={index} title={step.title} badge={step.badge}>
-                    {step.content}
-                </Step>
-            ))}
-        </Steps>
-    )
-}
+export const AndroidInstallation = createInstallation(getAndroidSteps)

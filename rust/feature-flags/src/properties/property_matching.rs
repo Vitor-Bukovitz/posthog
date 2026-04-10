@@ -1,12 +1,16 @@
 use std::collections::HashMap;
 
-use crate::properties::property_models::{OperatorType, PropertyFilter};
+use crate::properties::property_models::{CompiledRegex, OperatorType, PropertyFilter};
 use crate::properties::relative_date;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use dateparser::parse as parse_date;
-use regex::Regex;
+use fancy_regex::RegexBuilder;
 use semver::{Version, VersionReq};
 use serde_json::Value;
+
+/// Regex backtrack limit to prevent ReDoS attacks.
+/// 10k steps completes in ~1ms worst case, which is acceptable for a hot path.
+pub(crate) const REGEX_BACKTRACK_LIMIT: usize = 10_000;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum FlagMatchingError {
@@ -152,6 +156,38 @@ pub fn match_property(
                 Ok(operator == OperatorType::NotIcontains)
             }
         }
+        OperatorType::IcontainsMulti | OperatorType::NotIcontainsMulti => {
+            if let Some(match_value) = match_value {
+                let match_string = to_string_representation(match_value).to_ascii_lowercase();
+
+                // Handle both single values and arrays
+                let search_values: Vec<String> = match value {
+                    Value::Array(arr) => arr
+                        .iter()
+                        .map(|v| to_string_representation(v).to_ascii_lowercase())
+                        .collect(),
+                    single_value => {
+                        vec![to_string_representation(single_value).to_ascii_lowercase()]
+                    }
+                };
+
+                // Check if any of the search values is contained in the match value
+                let any_contained = search_values
+                    .iter()
+                    .any(|search_val| match_string.contains(search_val));
+
+                if operator == OperatorType::IcontainsMulti {
+                    Ok(any_contained)
+                } else {
+                    Ok(!any_contained)
+                }
+            } else {
+                // When value doesn't exist:
+                // - for IcontainsMulti: it's not a match (false)
+                // - for NotIcontainsMulti: it is a match (true)
+                Ok(operator == OperatorType::NotIcontainsMulti)
+            }
+        }
         OperatorType::Regex | OperatorType::NotRegex => {
             if match_value.is_none() {
                 // When value doesn't exist:
@@ -159,14 +195,32 @@ pub fn match_property(
                 // - for NotRegex: it is a match (true)
                 return Ok(operator == OperatorType::NotRegex);
             }
-            let pattern = match Regex::new(&to_string_representation(value)) {
-                Ok(pattern) => pattern,
-                Err(_) => {
-                    return Ok(false);
-                }
+
+            // Three-state dispatch:
+            // - Some(Compiled): use the pre-compiled regex (fast path)
+            // - Some(InvalidPattern): pattern was already known-bad, short-circuit
+            // - None: prepare_regex() was not called, compile on-the-fly (fallback
+            //   for cohort property filters and test code)
+            let compiled;
+            let regex: &fancy_regex::Regex = match &property.compiled_regex {
+                Some(CompiledRegex::Compiled(regex)) => regex,
+                Some(CompiledRegex::InvalidPattern) => return Ok(false),
+                None => match RegexBuilder::new(&to_string_representation(value))
+                    .backtrack_limit(REGEX_BACKTRACK_LIMIT)
+                    .build()
+                {
+                    Ok(regex) => {
+                        compiled = regex;
+                        &compiled
+                    }
+                    Err(_) => return Ok(false),
+                },
             };
+
             let haystack = to_string_representation(match_value.unwrap_or(&Value::Null));
-            let match_ = pattern.find(&haystack);
+            let match_ = regex
+                .find(&haystack)
+                .map_err(|_| FlagMatchingError::InvalidRegexPattern)?;
 
             if operator == OperatorType::Regex {
                 Ok(match_.is_some())
@@ -497,6 +551,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -551,6 +606,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -574,6 +630,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -619,6 +676,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -657,6 +715,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -732,6 +791,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -781,6 +841,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -839,6 +900,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -879,6 +941,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -920,6 +983,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
         assert!(match_property(
             &property_b,
@@ -955,6 +1019,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(!match_property(
@@ -978,6 +1043,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
         assert!(match_property(
             &property_d,
@@ -1009,6 +1075,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -1052,6 +1119,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -1099,6 +1167,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -1141,6 +1210,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -1188,6 +1258,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -1268,6 +1339,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(!match_property(
@@ -1290,6 +1362,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -1306,6 +1379,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -1328,6 +1402,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(!match_property(
@@ -1344,6 +1419,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(!match_property(
@@ -1378,6 +1454,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(!match_property(
@@ -1398,6 +1475,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(!match_property(
@@ -1414,6 +1492,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(!match_property(
@@ -1430,6 +1509,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -1467,6 +1547,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(!match_property(
@@ -1483,6 +1564,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -1499,6 +1581,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(!match_property(
@@ -1515,6 +1598,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -1531,6 +1615,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(!match_property(
@@ -1547,6 +1632,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(!match_property(
@@ -1563,6 +1649,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(!match_property(
@@ -1579,6 +1666,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(!match_property(
@@ -1596,6 +1684,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(!match_property(
@@ -1613,6 +1702,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         // Test with ISO8601 format in person properties
@@ -1648,6 +1738,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -1708,6 +1799,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         match_property(
@@ -1727,6 +1819,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         // Get current time and 3 days ago
@@ -1850,6 +1943,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -1888,6 +1982,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -1912,6 +2007,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -1943,6 +2039,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -1981,6 +2078,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -2012,6 +2110,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -2036,6 +2135,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -2064,6 +2164,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         // Test with 'v' prefix in property value
@@ -2082,6 +2183,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -2109,6 +2211,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         // Pre-release versions are less than the release version
@@ -2134,6 +2237,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -2157,6 +2261,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         // Invalid semver in property value should return false
@@ -2245,6 +2350,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -2262,6 +2368,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -2278,6 +2385,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -2297,6 +2405,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         // Missing property should return false
@@ -2326,6 +2435,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         // Should match: same version
@@ -2383,6 +2493,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -2403,6 +2514,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         // Should match: same version
@@ -2470,6 +2582,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         // Should match: any patch version in 1.2.x
@@ -2517,6 +2630,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         // Should match: any version in 1.x.x
@@ -2564,6 +2678,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -2588,6 +2703,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -2612,6 +2728,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         // Invalid patterns return an error (configuration error)
@@ -2633,6 +2750,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         // Should match higher pre-release in same patch version
@@ -2666,6 +2784,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -2692,6 +2811,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         // Invalid version in property value should return false
@@ -2710,6 +2830,7 @@ mod test_match_properties {
             prop_type: PropertyType::Person,
             group_type_index: None,
             negation: None,
+            compiled_regex: None,
         };
 
         assert!(match_property(
@@ -2718,5 +2839,554 @@ mod test_match_properties {
             true
         )
         .is_err());
+    }
+
+    #[test]
+    fn test_match_properties_regex_with_lookahead() {
+        // Positive lookahead: match "foo" only if followed by "bar"
+        let property_positive = PropertyFilter {
+            key: "key".to_string(),
+            value: Some(json!(r"foo(?=bar)")),
+            operator: Some(OperatorType::Regex),
+            prop_type: PropertyType::Person,
+            group_type_index: None,
+            negation: None,
+            compiled_regex: None,
+        };
+
+        assert!(match_property(
+            &property_positive,
+            &HashMap::from([("key".to_string(), json!("foobar"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(match_property(
+            &property_positive,
+            &HashMap::from([("key".to_string(), json!("foobar123"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(!match_property(
+            &property_positive,
+            &HashMap::from([("key".to_string(), json!("foobaz"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(!match_property(
+            &property_positive,
+            &HashMap::from([("key".to_string(), json!("foo"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // Negative lookahead: match "foo" only if NOT followed by "bar"
+        let property_negative = PropertyFilter {
+            key: "key".to_string(),
+            value: Some(json!(r"foo(?!bar)")),
+            operator: Some(OperatorType::Regex),
+            prop_type: PropertyType::Person,
+            group_type_index: None,
+            negation: None,
+            compiled_regex: None,
+        };
+
+        assert!(match_property(
+            &property_negative,
+            &HashMap::from([("key".to_string(), json!("foobaz"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(match_property(
+            &property_negative,
+            &HashMap::from([("key".to_string(), json!("foo"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(!match_property(
+            &property_negative,
+            &HashMap::from([("key".to_string(), json!("foobar"))]),
+            true
+        )
+        .expect("expected match to exist"));
+    }
+
+    #[test]
+    fn test_match_properties_regex_with_lookbehind() {
+        // Positive lookbehind: match "bar" only if preceded by "foo"
+        let property_positive = PropertyFilter {
+            key: "key".to_string(),
+            value: Some(json!(r"(?<=foo)bar")),
+            operator: Some(OperatorType::Regex),
+            prop_type: PropertyType::Person,
+            group_type_index: None,
+            negation: None,
+            compiled_regex: None,
+        };
+
+        assert!(match_property(
+            &property_positive,
+            &HashMap::from([("key".to_string(), json!("foobar"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(match_property(
+            &property_positive,
+            &HashMap::from([("key".to_string(), json!("123foobar456"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(!match_property(
+            &property_positive,
+            &HashMap::from([("key".to_string(), json!("bazbar"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(!match_property(
+            &property_positive,
+            &HashMap::from([("key".to_string(), json!("bar"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // Negative lookbehind: match "bar" only if NOT preceded by "foo"
+        let property_negative = PropertyFilter {
+            key: "key".to_string(),
+            value: Some(json!(r"(?<!foo)bar")),
+            operator: Some(OperatorType::Regex),
+            prop_type: PropertyType::Person,
+            group_type_index: None,
+            negation: None,
+            compiled_regex: None,
+        };
+
+        assert!(match_property(
+            &property_negative,
+            &HashMap::from([("key".to_string(), json!("bazbar"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(match_property(
+            &property_negative,
+            &HashMap::from([("key".to_string(), json!("bar"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(!match_property(
+            &property_negative,
+            &HashMap::from([("key".to_string(), json!("foobar"))]),
+            true
+        )
+        .expect("expected match to exist"));
+    }
+
+    #[test]
+    fn test_match_properties_regex_with_backreference() {
+        // Backreference: match repeated words like "the the" or "is is"
+        let property = PropertyFilter {
+            key: "key".to_string(),
+            value: Some(json!(r"\b(\w+)\s+\1\b")),
+            operator: Some(OperatorType::Regex),
+            prop_type: PropertyType::Person,
+            group_type_index: None,
+            negation: None,
+            compiled_regex: None,
+        };
+
+        assert!(match_property(
+            &property,
+            &HashMap::from([("key".to_string(), json!("the the"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(match_property(
+            &property,
+            &HashMap::from([("key".to_string(), json!("this is is a test"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(!match_property(
+            &property,
+            &HashMap::from([("key".to_string(), json!("the quick brown fox"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(!match_property(
+            &property,
+            &HashMap::from([("key".to_string(), json!("hello world"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // Another backreference: match HTML-like tags where opening and closing match
+        let property_tags = PropertyFilter {
+            key: "key".to_string(),
+            value: Some(json!(r"<(\w+)>.*</\1>")),
+            operator: Some(OperatorType::Regex),
+            prop_type: PropertyType::Person,
+            group_type_index: None,
+            negation: None,
+            compiled_regex: None,
+        };
+
+        assert!(match_property(
+            &property_tags,
+            &HashMap::from([("key".to_string(), json!("<div>content</div>"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(match_property(
+            &property_tags,
+            &HashMap::from([("key".to_string(), json!("<span>text</span>"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(!match_property(
+            &property_tags,
+            &HashMap::from([("key".to_string(), json!("<div>content</span>"))]),
+            true
+        )
+        .expect("expected match to exist"));
+    }
+
+    #[test]
+    fn test_match_properties_regex_complex_patterns() {
+        // Real-world example: match email addresses from specific domains using lookahead
+        let property = PropertyFilter {
+            key: "email".to_string(),
+            value: Some(json!(r"^[\w.+-]+@(?=.*\.(com|org)$)[\w.-]+$")),
+            operator: Some(OperatorType::Regex),
+            prop_type: PropertyType::Person,
+            group_type_index: None,
+            negation: None,
+            compiled_regex: None,
+        };
+
+        assert!(match_property(
+            &property,
+            &HashMap::from([("email".to_string(), json!("user@example.com"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(match_property(
+            &property,
+            &HashMap::from([("email".to_string(), json!("test@posthog.org"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(!match_property(
+            &property,
+            &HashMap::from([("email".to_string(), json!("user@example.net"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // Password validation: at least one uppercase, one lowercase, one digit
+        let password_check = PropertyFilter {
+            key: "password".to_string(),
+            value: Some(json!(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$")),
+            operator: Some(OperatorType::Regex),
+            prop_type: PropertyType::Person,
+            group_type_index: None,
+            negation: None,
+            compiled_regex: None,
+        };
+
+        assert!(match_property(
+            &password_check,
+            &HashMap::from([("password".to_string(), json!("Password1"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(match_property(
+            &password_check,
+            &HashMap::from([("password".to_string(), json!("SecurePass123"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(!match_property(
+            &password_check,
+            &HashMap::from([("password".to_string(), json!("password"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        assert!(!match_property(
+            &password_check,
+            &HashMap::from([("password".to_string(), json!("SHORT1"))]),
+            true
+        )
+        .expect("expected match to exist"));
+    }
+
+    #[test]
+    fn test_match_properties_regex_backtracking_limit() {
+        // Test that pathological regex patterns complete quickly due to backtrack limits.
+        // The backtrack limit only applies to patterns using "fancy" features (lookahead,
+        // lookbehind, backreferences) since fancy-regex delegates simple patterns to the
+        // standard regex crate which uses a non-backtracking DFA/NFA algorithm.
+        //
+        // This pattern uses a backreference which forces the backtracking engine,
+        // combined with nested quantifiers that cause exponential backtracking.
+        let property = PropertyFilter {
+            key: "key".to_string(),
+            value: Some(json!(r"^(a+)+\1$")),
+            operator: Some(OperatorType::Regex),
+            prop_type: PropertyType::Person,
+            group_type_index: None,
+            negation: None,
+            compiled_regex: None,
+        };
+
+        // Should match when the string is repeated correctly
+        assert!(match_property(
+            &property,
+            &HashMap::from([("key".to_string(), json!("aaaa"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // This causes exponential backtracking: the engine tries many ways to split
+        // the 'a's between the group and the backreference, and with the nested
+        // quantifier (a+)+, each split has many sub-combinations to try.
+        let pathological_input = "a".repeat(30) + "!";
+        let start = std::time::Instant::now();
+        let result = match_property(
+            &property,
+            &HashMap::from([("key".to_string(), json!(pathological_input))]),
+            true,
+        );
+        let elapsed = start.elapsed();
+
+        // The key assertion: this should complete quickly (not hang)
+        // With 10k backtrack limit, should complete in well under 100ms
+        assert!(
+            elapsed.as_millis() < 100,
+            "Regex matching took too long: {:?}",
+            elapsed
+        );
+
+        // Result should be an error due to backtracking limit being exceeded
+        assert!(
+            matches!(result, Err(FlagMatchingError::InvalidRegexPattern)),
+            "Expected InvalidRegexPattern error due to backtrack limit, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_match_properties_icontains_multi() {
+        // Test icontains_multi with array of values
+        let property_array = PropertyFilter {
+            key: "email".to_string(),
+            value: Some(json!(["@gmail.com", "@yahoo.com"])),
+            operator: Some(OperatorType::IcontainsMulti),
+            prop_type: PropertyType::Person,
+            group_type_index: None,
+            negation: None,
+            compiled_regex: None,
+        };
+
+        // Should match gmail
+        assert!(match_property(
+            &property_array,
+            &HashMap::from([("email".to_string(), json!("user@gmail.com"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // Should match yahoo
+        assert!(match_property(
+            &property_array,
+            &HashMap::from([("email".to_string(), json!("user@yahoo.com"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // Should not match hotmail
+        assert!(!match_property(
+            &property_array,
+            &HashMap::from([("email".to_string(), json!("user@hotmail.com"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // Test icontains_multi with single value
+        let property_single = PropertyFilter {
+            key: "name".to_string(),
+            value: Some(json!("john")),
+            operator: Some(OperatorType::IcontainsMulti),
+            prop_type: PropertyType::Person,
+            group_type_index: None,
+            negation: None,
+            compiled_regex: None,
+        };
+
+        // Should match case-insensitively
+        assert!(match_property(
+            &property_single,
+            &HashMap::from([("name".to_string(), json!("John Doe"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // Should not match different name
+        assert!(!match_property(
+            &property_single,
+            &HashMap::from([("name".to_string(), json!("Jane Doe"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // Should return error when key doesn't exist in partial mode
+        assert!(match_property(
+            &property_single,
+            &HashMap::from([("other_key".to_string(), json!("value"))]),
+            true
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_match_properties_not_icontains_multi() {
+        // Test not_icontains_multi with array of values
+        let property_array = PropertyFilter {
+            key: "email".to_string(),
+            value: Some(json!(["@gmail.com", "@yahoo.com"])),
+            operator: Some(OperatorType::NotIcontainsMulti),
+            prop_type: PropertyType::Person,
+            group_type_index: None,
+            negation: None,
+            compiled_regex: None,
+        };
+
+        // Should not match gmail (negated)
+        assert!(!match_property(
+            &property_array,
+            &HashMap::from([("email".to_string(), json!("user@gmail.com"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // Should not match yahoo (negated)
+        assert!(!match_property(
+            &property_array,
+            &HashMap::from([("email".to_string(), json!("user@yahoo.com"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // Should match hotmail (does not contain any of the blocked domains)
+        assert!(match_property(
+            &property_array,
+            &HashMap::from([("email".to_string(), json!("user@hotmail.com"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // Test not_icontains_multi with single value
+        let property_single = PropertyFilter {
+            key: "name".to_string(),
+            value: Some(json!("spam")),
+            operator: Some(OperatorType::NotIcontainsMulti),
+            prop_type: PropertyType::Person,
+            group_type_index: None,
+            negation: None,
+            compiled_regex: None,
+        };
+
+        // Should match when value doesn't contain spam
+        assert!(match_property(
+            &property_single,
+            &HashMap::from([("name".to_string(), json!("John Doe"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // Should not match when value contains spam
+        assert!(!match_property(
+            &property_single,
+            &HashMap::from([("name".to_string(), json!("Spam Email"))]),
+            true
+        )
+        .expect("expected match to exist"));
+    }
+
+    #[test]
+    fn test_match_properties_icontains_multi_empty_values() {
+        // Test with empty array
+        let property_empty = PropertyFilter {
+            key: "test".to_string(),
+            value: Some(json!([])),
+            operator: Some(OperatorType::IcontainsMulti),
+            prop_type: PropertyType::Person,
+            group_type_index: None,
+            negation: None,
+            compiled_regex: None,
+        };
+
+        // Empty array should not match anything
+        assert!(!match_property(
+            &property_empty,
+            &HashMap::from([("test".to_string(), json!("any value"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // Test with missing key should default to false for icontains_multi
+        assert!(!match_property(
+            &property_empty,
+            &HashMap::from([("other_key".to_string(), json!("value"))]),
+            false // non-partial mode
+        )
+        .expect("expected match to exist"));
+    }
+
+    #[test]
+    fn test_match_properties_not_icontains_multi_empty_values() {
+        // Test with empty array
+        let property_empty = PropertyFilter {
+            key: "test".to_string(),
+            value: Some(json!([])),
+            operator: Some(OperatorType::NotIcontainsMulti),
+            prop_type: PropertyType::Person,
+            group_type_index: None,
+            negation: None,
+            compiled_regex: None,
+        };
+
+        // Empty array should match everything (nothing to exclude)
+        assert!(match_property(
+            &property_empty,
+            &HashMap::from([("test".to_string(), json!("any value"))]),
+            true
+        )
+        .expect("expected match to exist"));
+
+        // Test with missing key should default to true for not_icontains_multi
+        assert!(match_property(
+            &property_empty,
+            &HashMap::from([("other_key".to_string(), json!("value"))]),
+            false // non-partial mode
+        )
+        .expect("expected match to exist"));
     }
 }

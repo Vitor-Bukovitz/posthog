@@ -32,17 +32,16 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import APIException
 from rest_framework.request import Request
 from rest_framework.response import Response
+from social_core.exceptions import AuthFailed, AuthMissingParameter
 from social_django.strategy import DjangoStrategy
 from social_django.views import auth
 from two_factor.utils import default_device
 from two_factor.views.core import REMEMBER_COOKIE_PREFIX
 from two_factor.views.utils import get_remember_device_cookie, validate_remember_device_cookie
-from webauthn import generate_authentication_options, verify_authentication_response
 from webauthn.helpers import base64url_to_bytes, bytes_to_base64url, options_to_json
-from webauthn.helpers.structs import AuthenticatorTransport, PublicKeyCredentialDescriptor, UserVerificationRequirement
+from webauthn.helpers.structs import AuthenticatorTransport, PublicKeyCredentialDescriptor
 
 from posthog.api.email_verification import EmailVerifier, is_email_verification_disabled
-from posthog.auth import get_webauthn_rp_id, get_webauthn_rp_origin
 from posthog.caching.login_device_cache import check_and_cache_login_device
 from posthog.email import is_email_available
 from posthog.event_usage import report_user_logged_in, report_user_password_reset
@@ -59,6 +58,7 @@ from posthog.helpers.two_factor_session import (
 from posthog.models import OrganizationDomain, User
 from posthog.models.activity_logging import signal_handlers  # noqa: F401
 from posthog.models.webauthn_credential import WebauthnCredential
+from posthog.passkey import generate_passkey_authentication_options, verify_passkey_authentication_response
 from posthog.rate_limit import EmailMFAResendThrottle, EmailMFAThrottle, TwoFactorThrottle, UserPasswordResetThrottle
 from posthog.tasks.email import (
     login_from_new_device_notification,
@@ -66,7 +66,9 @@ from posthog.tasks.email import (
     send_two_factor_auth_backup_code_used_email,
 )
 from posthog.utils import get_instance_available_sso_providers, get_ip_address, get_short_user_agent
+from posthog.workos_radar import RadarAction, RadarAuthMethod, evaluate_auth_attempt
 
+logger = structlog.get_logger("posthog.auth")
 mfa_logger = structlog.get_logger("posthog.auth.mfa")
 
 USER_AUTH_METHOD_MISMATCH = Counter(
@@ -108,10 +110,6 @@ def post_login(sender, user, request: HttpRequest, **kwargs):
 
 @csrf_protect
 def logout(request):
-    if request.user.is_authenticated:
-        request.user.temporary_token = None
-        request.user.save()
-
     clear_two_factor_session_flags(request)
 
     request.session.pop("reauth", None)
@@ -148,9 +146,13 @@ def sso_login(request: HttpRequest, backend: str) -> HttpResponse:
         return redirect(f"/login?error_code=invalid_sso_provider")
 
     if not sso_providers[backend]:
-        return redirect(f"/login?error_code=improperly_configured_sso")
+        return redirect("/login?error_code=improperly_configured_sso")
 
-    return auth(request, backend)
+    try:
+        return auth(request, backend)
+    except (AuthFailed, AuthMissingParameter) as e:
+        logger.warning("SSO login failed, redirecting to login page", exc_info=e)
+        return redirect("/login?error_code=improperly_configured_sso")
 
 
 class TwoFactorRequired(APIException):
@@ -230,8 +232,22 @@ class LoginSerializer(serializers.Serializer):
             )
 
         request = self.context["request"]
+
+        existing_user = User.objects.filter(email__iexact=validated_data["email"]).first()
+        evaluate_auth_attempt(
+            request=request._request,
+            email=validated_data["email"],
+            action=RadarAction.SIGNIN,
+            auth_method=RadarAuthMethod.PASSWORD,
+            user_id=str(existing_user.distinct_id) if existing_user else None,
+        )
+
         axes_request = getattr(request, "_request", request)
-        was_authenticated_before_login_attempt = bool(getattr(request, "user", None) and request.user.is_authenticated)
+        was_authenticated_before_login_attempt = bool(
+            getattr(request, "user", None)
+            and request.user.is_authenticated
+            and request.user.email.lower() == validated_data["email"].lower()
+        )
 
         # Initialize axes handler via proxy so request metadata is populated consistently
         from axes.exceptions import AxesBackendPermissionDenied
@@ -470,14 +486,11 @@ class TwoFactorViewSet(NonCreatingViewSetMixin, viewsets.GenericViewSet):
 
             # Verify the authentication response
             expected_challenge = base64url_to_bytes(challenge_b64)
-            verification = verify_authentication_response(
+            verification = verify_passkey_authentication_response(
                 credential=credential_dict,
                 expected_challenge=expected_challenge,
-                expected_rp_id=get_webauthn_rp_id(),
-                expected_origin=get_webauthn_rp_origin(),
                 credential_public_key=credential.public_key,
                 credential_current_sign_count=credential.counter,
-                require_user_verification=True,
             )
 
             # Update sign count
@@ -685,12 +698,7 @@ class TwoFactorPasskeyViewSet(NonCreatingViewSetMixin, viewsets.GenericViewSet):
         ]
 
         # Generate authentication options
-        options = generate_authentication_options(
-            rp_id=get_webauthn_rp_id(),
-            allow_credentials=allow_credentials,
-            user_verification=UserVerificationRequirement.REQUIRED,
-            timeout=300000,  # 5 minutes
-        )
+        options = generate_passkey_authentication_options(allow_credentials=allow_credentials)
 
         # Store challenge in session
         request.session[WEBAUTHN_2FA_CHALLENGE_KEY] = bytes_to_base64url(options.challenge)
@@ -819,9 +827,12 @@ class PasswordResetSerializer(serializers.Serializer):
             )
 
         try:
-            user = User.objects.filter(is_active=True).get(email=email)
+            user = User.objects.filter(is_active=True).get(email__iexact=email)
         except User.DoesNotExist:
             user = None
+        except User.MultipleObjectsReturned:
+            # If multiple users share the same email (different casing), use the exact match
+            user = User.objects.filter(is_active=True, email=email).first()
 
         if user:
             user.requested_password_reset_at = datetime.datetime.now(datetime.UTC)
@@ -848,7 +859,7 @@ class PasswordResetCompleteSerializer(serializers.Serializer):
 
         try:
             user = User.objects.filter(is_active=True).get(uuid=self.context["view"].kwargs["user_uuid"])
-        except User.DoesNotExist:
+        except (User.DoesNotExist, ValidationError):
             capture_exception(
                 Exception("User not found in password reset serializer"),
                 {"user_uuid": self.context["view"].kwargs["user_uuid"]},
@@ -908,7 +919,7 @@ class PasswordResetCompleteViewSet(NonCreatingViewSetMixin, mixins.RetrieveModel
 
         try:
             user = User.objects.filter(is_active=True).get(uuid=user_uuid)
-        except User.DoesNotExist:
+        except (User.DoesNotExist, ValidationError):
             capture_exception(
                 Exception("User not found in password reset viewset"), {"user_uuid": user_uuid, "token": token}
             )
@@ -940,7 +951,7 @@ class PasswordResetTokenGenerator(DefaultPasswordResetTokenGenerator):
         # Due to type differences between the user model and the token generator, we need to
         # re-fetch the user from the database to get the correct type.
         usable_user: User = User.objects.get(pk=user.pk)
-        return f"{user.pk}{user.email}{usable_user.requested_password_reset_at}{timestamp}"
+        return f"{user.pk}{user.email}{usable_user.requested_password_reset_at}{timestamp}{usable_user.password}"
 
 
 password_reset_token_generator = PasswordResetTokenGenerator()

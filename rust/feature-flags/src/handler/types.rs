@@ -6,8 +6,12 @@ use std::{collections::HashMap, fmt, net::IpAddr, sync::Arc};
 use uuid::Uuid;
 
 use crate::{
-    api::types::FlagsQueryParams, cohorts::cohort_cache_manager::CohortCacheManager,
-    flags::flag_models::FeatureFlagList, router, utils::user_agent::UserAgentInfo,
+    api::types::FlagsQueryParams,
+    cohorts::{cohort_cache_manager::CohortCacheManager, membership::CohortMembershipProvider},
+    flags::{flag_group_type_mapping::GroupTypeCacheManager, flag_models::FeatureFlagList},
+    rayon_dispatcher::RayonDispatcher,
+    router,
+    utils::user_agent::UserAgentInfo,
 };
 
 pub struct RequestContext {
@@ -51,6 +55,7 @@ pub struct FeatureFlagEvaluationContext {
     pub non_persons_reader: Arc<dyn common_database::Client + Send + Sync>,
     pub non_persons_writer: Arc<dyn common_database::Client + Send + Sync>,
     pub cohort_cache: Arc<CohortCacheManager>,
+    pub group_type_cache: Arc<GroupTypeCacheManager>,
     pub person_property_overrides: Option<HashMap<String, Value>>,
     pub group_property_overrides: Option<HashMap<String, HashMap<String, Value>>>,
     pub groups: Option<HashMap<String, Value>>,
@@ -60,6 +65,16 @@ pub struct FeatureFlagEvaluationContext {
     /// When true, skip hash key override lookups for flags that don't need them
     /// (e.g., 100% rollout with no multivariate variants).
     pub optimize_experience_continuity_lookups: bool,
+    /// Flag count threshold for switching from sequential to parallel evaluation.
+    pub parallel_eval_threshold: usize,
+    /// Dispatcher for bounded-concurrency Rayon batch evaluation.
+    pub rayon_dispatcher: RayonDispatcher,
+    /// When true, skip all writes to PostgreSQL and Redis.
+    pub skip_writes: bool,
+    /// Provider for realtime/behavioral cohort membership lookups.
+    pub cohort_membership_provider: Arc<dyn CohortMembershipProvider>,
+    /// Whether to enable realtime cohort evaluation.
+    pub enable_realtime_cohort_evaluation: bool,
 }
 
 /// SDK type classification based on user-agent parsing.
@@ -96,6 +111,8 @@ pub enum Library {
     PosthogReactNative,
     /// posthog-flutter SDK
     PosthogFlutter,
+    /// posthog-server SDK (deprecated: users are migrating to posthog-java)
+    PosthogServer,
     /// Unknown or unrecognized SDK
     Other,
 }
@@ -120,6 +137,7 @@ impl Library {
             Library::PosthogIos => "posthog-ios",
             Library::PosthogReactNative => "posthog-react-native",
             Library::PosthogFlutter => "posthog-flutter",
+            Library::PosthogServer => "posthog-server",
             Library::Other => "other",
         }
     }
@@ -141,6 +159,7 @@ impl Library {
         Library::PosthogIos,
         Library::PosthogReactNative,
         Library::PosthogFlutter,
+        Library::PosthogServer,
     ];
 }
 
@@ -236,6 +255,8 @@ mod tests {
     #[case("posthog-java/1.2.0", Library::PosthogJava)]
     #[case("posthog-dotnet/1.0.0", Library::PosthogDotnet)]
     #[case("posthog-elixir/0.2.0", Library::PosthogElixir)]
+    #[case("posthog-server/1.0.0", Library::PosthogServer)]
+    #[case("posthog-server/3.2.1 (Android SDK)", Library::PosthogServer)]
     // Client-side SDKs
     #[case("posthog-js/1.88.0", Library::PosthogJs)]
     #[case("posthog-android/3.0.0", Library::PosthogAndroid)]
@@ -322,6 +343,7 @@ mod tests {
     #[case(Library::PosthogIos, "posthog-ios")]
     #[case(Library::PosthogReactNative, "posthog-react-native")]
     #[case(Library::PosthogFlutter, "posthog-flutter")]
+    #[case(Library::PosthogServer, "posthog-server")]
     #[case(Library::Other, "other")]
     fn test_library_display(#[case] library: Library, #[case] expected: &str) {
         assert_eq!(library.to_string(), expected);
@@ -341,6 +363,7 @@ mod tests {
     #[case(Library::PosthogIos, "\"posthog-ios\"")]
     #[case(Library::PosthogReactNative, "\"posthog-react-native\"")]
     #[case(Library::PosthogFlutter, "\"posthog-flutter\"")]
+    #[case(Library::PosthogServer, "\"posthog-server\"")]
     #[case(Library::Other, "\"other\"")]
     fn test_library_serialization(#[case] library: Library, #[case] expected_json: &str) {
         assert_eq!(serde_json::to_string(&library).unwrap(), expected_json);

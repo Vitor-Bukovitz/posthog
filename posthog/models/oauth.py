@@ -27,11 +27,16 @@ class OAuthApplicationAccessLevel(enum.Enum):
     TEAM = "team"
 
 
+class OAuthApplicationAuthBrand(enum.Enum):
+    POSTHOG = "posthog"
+    TWIG = "twig"
+
+
 def is_loopback_host(hostname: str | None) -> bool:
-    """Check if hostname is a loopback address (localhost or 127.0.0.0/8)."""
+    """Check if hostname is a loopback address (localhost, 127.0.0.0/8, or ::1)."""
     if not hostname:
         return False
-    if hostname == "localhost":
+    if hostname in ("localhost", "::1", "[::1]"):
         return True
     # Check for IPv4 loopback range 127.0.0.0/8
     if hostname.startswith("127.") and hostname.count(".") == 3:
@@ -42,6 +47,67 @@ def is_loopback_host(hostname: str | None) -> bool:
 
 
 class OAuthApplication(AbstractApplication):
+    id: models.UUIDField = models.UUIDField(primary_key=True, default=UUIDT, editable=False)
+
+    # NOTE: By default an application should be linked to the organization that created it.
+    # It can be null if the organization that created it is deleted, or it was created outside of an organization (e.g. using dynamic client registration)
+    # Only admins of the organization should have permission to edit the application.
+    organization: "Organization | None" = models.ForeignKey(  # type: ignore[assignment]
+        "posthog.Organization", on_delete=models.SET_NULL, null=True, blank=True, related_name="oauth_applications"
+    )
+
+    # NOTE: The user that created the application. It should not be used to check for access to the application, since the user might have left the organization.
+    user: "User | None" = models.ForeignKey("posthog.User", on_delete=models.SET_NULL, null=True, blank=True)  # type: ignore[assignment]
+
+    logo_uri: models.URLField = models.URLField(
+        max_length=2048, null=True, blank=True, help_text="URL to the client's logo image"
+    )
+
+    # DCR (Dynamic Client Registration) fields - RFC 7591
+    is_dcr_client: models.BooleanField = models.BooleanField(
+        default=False,
+        verbose_name="Is DCR client",
+        help_text="True if this client was registered via Dynamic Client Registration",
+    )
+    dcr_client_id_issued_at: models.DateTimeField = models.DateTimeField(
+        null=True, blank=True, help_text="When the client_id was issued (for DCR clients)"
+    )
+
+    # Verification status - manually set by PostHog staff
+    is_verified: models.BooleanField = models.BooleanField(
+        default=False, help_text="True if this application has been verified by PostHog"
+    )
+
+    # First-party flag - manually set by PostHog staff
+    # First-party apps skip the OAuth consent screen and can use direct token exchange
+    is_first_party: models.BooleanField = models.BooleanField(
+        default=False, help_text="True if this is a first-party PostHog application that skips OAuth consent"
+    )
+
+    auth_brand: models.CharField = models.CharField(
+        max_length=32,
+        choices=[(brand.value, brand.value) for brand in OAuthApplicationAuthBrand],
+        default=OAuthApplicationAuthBrand.POSTHOG.value,
+        help_text="Branding to use on authentication pages",
+    )
+
+    # CIMD (Client ID Metadata Document) fields — draft-ietf-oauth-client-id-metadata-document-00
+    is_cimd_client: models.BooleanField = models.BooleanField(
+        default=False,
+        verbose_name="Is CIMD client",
+        help_text="True if this client was registered via Client ID Metadata Document (CIMD)",
+    )
+    cimd_metadata_url: models.URLField = models.URLField(
+        max_length=2048,
+        null=True,
+        blank=True,
+        unique=True,
+        help_text="The URL used as client_id for CIMD clients. Must match the client_id in the metadata document.",
+    )
+    cimd_metadata_last_fetched: models.DateTimeField = models.DateTimeField(
+        null=True, blank=True, help_text="When the CIMD metadata was last successfully fetched"
+    )
+
     class Meta(AbstractApplication.Meta):
         verbose_name = "OAuth Application"
         verbose_name_plural = "OAuth Applications"
@@ -59,6 +125,21 @@ class OAuthApplication(AbstractApplication):
             ),
         ]
 
+    # Dangerous URI schemes that could be used for attacks (XSS, data exfiltration, etc.)
+    DEFAULT_BLOCKED_SCHEMES = frozenset(["javascript", "data", "file", "blob", "vbscript"])
+
+    @staticmethod
+    def get_blocked_schemes() -> set[str]:
+        """Get the set of blocked redirect URI schemes from settings."""
+        return set(
+            cast(
+                list[str],
+                settings.OAUTH2_PROVIDER.get(
+                    "BLOCKED_REDIRECT_URI_SCHEMES", list(OAuthApplication.DEFAULT_BLOCKED_SCHEMES)
+                ),
+            )
+        )
+
     def clean(self):
         super().clean()
 
@@ -72,17 +153,16 @@ class OAuthApplication(AbstractApplication):
                 raise ValidationError({"redirect_uris": f"Redirect URI {uri} cannot contain fragments"})
 
             # Custom URL schemes for native apps (RFC 8252 Section 7.1)
-            # These look like: myapp://callback, array://oauth
+            # These look like: myapp://callback, posthog-code://oauth
             is_custom_scheme = parsed_uri.scheme not in ["http", "https", ""]
 
             if is_custom_scheme:
-                allowed_schemes = cast(
-                    list[str], settings.OAUTH2_PROVIDER.get("ALLOWED_REDIRECT_URI_SCHEMES", ["http", "https"])
-                )
-                if parsed_uri.scheme not in allowed_schemes:
+                # Block dangerous schemes that could be used for attacks (XSS, data exfiltration, etc.)
+                # Since we use DCR with pre-registration, clients can use any scheme not in this blocklist
+                if parsed_uri.scheme in self.get_blocked_schemes():
                     raise ValidationError(
                         {
-                            "redirect_uris": f"Redirect URI scheme '{parsed_uri.scheme}' is not allowed. Allowed schemes: {', '.join(allowed_schemes)}"
+                            "redirect_uris": f"Redirect URI scheme '{parsed_uri.scheme}' is not allowed for security reasons"
                         }
                     )
             else:
@@ -107,43 +187,16 @@ class OAuthApplication(AbstractApplication):
         super().save(*args, **kwargs)
 
     def get_allowed_schemes(self) -> list[str]:
-        """Extract unique schemes from the application's registered redirect URIs, filtered against allowed schemes."""
-        from django.conf import settings
-
-        allowed_list = cast(list[str], settings.OAUTH2_PROVIDER.get("ALLOWED_REDIRECT_URI_SCHEMES", ["http", "https"]))
-        globally_allowed = set(allowed_list)
+        """Extract unique schemes from the application's registered redirect URIs, filtering out blocked schemes."""
+        blocked_schemes = self.get_blocked_schemes()
         schemes: set[str] = set()
         for uri in self.redirect_uris.split(" "):
             if not uri:
                 continue
             parsed_uri = urlparse(uri)
-            if parsed_uri.scheme and parsed_uri.scheme in globally_allowed:
+            if parsed_uri.scheme and parsed_uri.scheme not in blocked_schemes:
                 schemes.add(parsed_uri.scheme)
         return list(schemes) if schemes else ["https"]
-
-    id: models.UUIDField = models.UUIDField(primary_key=True, default=UUIDT, editable=False)
-    # NOTE: By default an application should be linked to the organization that created it.
-    # It can be null if the organization that created it is deleted, or it was created outside of an organization (e.g. using dynamic client registration)
-    # Only admins of the organization should have permission to edit the application.
-    organization: "Organization | None" = models.ForeignKey(  # type: ignore[assignment]
-        "posthog.Organization", on_delete=models.SET_NULL, null=True, blank=True, related_name="oauth_applications"
-    )
-
-    # NOTE: The user that created the application. It should not be used to check for access to the application, since the user might have left the organization.
-    user: "User | None" = models.ForeignKey("posthog.User", on_delete=models.SET_NULL, null=True, blank=True)  # type: ignore[assignment]
-
-    # DCR (Dynamic Client Registration) fields - RFC 7591
-    is_dcr_client: models.BooleanField = models.BooleanField(
-        default=False, help_text="True if this client was registered via Dynamic Client Registration"
-    )
-    dcr_client_id_issued_at: models.DateTimeField = models.DateTimeField(
-        null=True, blank=True, help_text="When the client_id was issued (for DCR clients)"
-    )
-
-    # Verification status - manually set by PostHog staff
-    is_verified: models.BooleanField = models.BooleanField(
-        default=False, help_text="True if this application has been verified by PostHog"
-    )
 
 
 class OAuthAccessToken(AbstractAccessToken):

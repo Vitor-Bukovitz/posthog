@@ -1,27 +1,33 @@
-import { useMDXComponents } from 'scenes/onboarding/OnboardingDocsContentWrapper'
-import { PersonProfiles } from './_snippets/person-profiles'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+
 import { StepDefinition } from '../steps'
 
-export const getIOSSteps = (CodeBlock: any, Markdown: any, dedent: any): StepDefinition[] => {
+export const getIOSSteps = (
+    ctx: OnboardingComponentsContext,
+    options?: {
+        includeExperimentalSpi?: boolean
+        experimentalDescription?: string
+        minVersionPod?: string
+        minVersionSPM?: string
+    }
+): StepDefinition[] => {
+    const { CodeBlock, Markdown, CalloutBox, dedent } = ctx
+
+    const podVersion = options?.minVersionPod || '3.0'
+    const spmVersion = options?.minVersionSPM || '3.0.0'
+
     return [
         {
-            title: 'Install via CocoaPods',
+            title: 'Install dependency',
             badge: 'required',
             content: (
                 <>
-                    <Markdown>Add PostHog to your Podfile:</Markdown>
-                    <CodeBlock
-                        blocks={[
-                            {
-                                language: 'ruby',
-                                file: 'Podfile',
-                                code: dedent`
-                                    pod "PostHog", "~> 3.0"
-                                `,
-                            },
-                        ]}
-                    />
-                    <Markdown>Or install via Swift Package Manager:</Markdown>
+                    {options?.experimentalDescription && (
+                        <CalloutBox type="fyi" title="Experimental API">
+                            <Markdown>{options.experimentalDescription}</Markdown>
+                        </CalloutBox>
+                    )}
+                    <Markdown>Install via Swift Package Manager:</Markdown>
                     <CodeBlock
                         blocks={[
                             {
@@ -29,8 +35,20 @@ export const getIOSSteps = (CodeBlock: any, Markdown: any, dedent: any): StepDef
                                 file: 'Package.swift',
                                 code: dedent`
                                     dependencies: [
-                                      .package(url: "https://github.com/PostHog/posthog-ios.git", from: "3.0.0")
+                                      .package(url: "https://github.com/PostHog/posthog-ios.git", from: "${spmVersion}")
                                     ]
+                                `,
+                            },
+                        ]}
+                    />
+                    <Markdown>Or add PostHog to your Podfile:</Markdown>
+                    <CodeBlock
+                        blocks={[
+                            {
+                                language: 'ruby',
+                                file: 'Podfile',
+                                code: dedent`
+                                    pod "PostHog", "~> ${podVersion}"
                                 `,
                             },
                         ]}
@@ -51,15 +69,15 @@ export const getIOSSteps = (CodeBlock: any, Markdown: any, dedent: any): StepDef
                                 file: 'AppDelegate.swift',
                                 code: dedent`
                                     import Foundation
-                                    import PostHog
+                                    ${options?.includeExperimentalSpi ? '@_spi(Experimental) ' : ''}import PostHog
                                     import UIKit
 
                                     class AppDelegate: NSObject, UIApplicationDelegate {
                                         func application(_: UIApplication, didFinishLaunchingWithOptions _: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-                                            let POSTHOG_API_KEY = "<ph_project_api_key>"
+                                            let POSTHOG_PROJECT_TOKEN = "<ph_project_token>"
                                             let POSTHOG_HOST = "<ph_client_api_host>"
 
-                                            let config = PostHogConfig(apiKey: POSTHOG_API_KEY, host: POSTHOG_HOST)
+                                            let config = PostHogConfig(apiKey: POSTHOG_PROJECT_TOKEN, host: POSTHOG_HOST)
                                             PostHogSDK.shared.setup(config)
 
                                             return true
@@ -92,24 +110,10 @@ export const getIOSSteps = (CodeBlock: any, Markdown: any, dedent: any): StepDef
                             },
                         ]}
                     />
-                    <PersonProfiles language="swift" />
                 </>
             ),
         },
     ]
 }
 
-export const IOSInstallation = (): JSX.Element => {
-    const { Steps, Step, CodeBlock, Markdown, dedent } = useMDXComponents()
-    const steps = getIOSSteps(CodeBlock, Markdown, dedent)
-
-    return (
-        <Steps>
-            {steps.map((step, index) => (
-                <Step key={index} title={step.title} badge={step.badge}>
-                    {step.content}
-                </Step>
-            ))}
-        </Steps>
-    )
-}
+export const IOSInstallation = createInstallation(getIOSSteps)

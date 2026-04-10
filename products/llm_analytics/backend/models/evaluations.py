@@ -18,6 +18,7 @@ class Evaluation(UUIDTModel):
         indexes = [
             models.Index(fields=["team", "-created_at", "id"]),
             models.Index(fields=["team", "enabled"]),
+            models.Index(fields=["model_configuration"], name="llm_analyti_model_c_idx"),
         ]
 
     # Core fields
@@ -33,6 +34,16 @@ class Evaluation(UUIDTModel):
 
     conditions = models.JSONField(default=list)
 
+    # Model configuration for the LLM judge
+    model_configuration = models.ForeignKey(
+        "llm_analytics.LLMModelConfiguration",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="evaluations",
+        db_index=False,
+    )
+
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -44,6 +55,7 @@ class Evaluation(UUIDTModel):
 
     def save(self, *args, **kwargs):
         from posthog.cdp.filters import compile_filters_bytecode
+        from posthog.cdp.validation import compile_hog
 
         # Validate evaluation and output configs
         if self.evaluation_config or self.output_config:
@@ -53,6 +65,14 @@ class Evaluation(UUIDTModel):
                 )
             except ValueError as e:
                 raise ValidationError(str(e))
+
+        # Compile Hog source to bytecode
+        if self.evaluation_type == EvaluationType.HOG and self.evaluation_config.get("source"):
+            try:
+                bytecode = compile_hog(self.evaluation_config["source"], "destination")
+                self.evaluation_config["bytecode"] = bytecode
+            except Exception as e:
+                raise ValidationError({"evaluation_config": f"Failed to compile Hog code: {e}"})
 
         # Compile bytecode for each condition
         compiled_conditions = []

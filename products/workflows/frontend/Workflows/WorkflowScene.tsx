@@ -1,5 +1,5 @@
 import clsx from 'clsx'
-import { useValues } from 'kea'
+import { BindLogic, useValues } from 'kea'
 import { router } from 'kea-router'
 
 import { SpinnerOverlay } from '@posthog/lemon-ui'
@@ -7,18 +7,20 @@ import { SpinnerOverlay } from '@posthog/lemon-ui'
 import { ActivityLog } from 'lib/components/ActivityLog/ActivityLog'
 import { NotFound } from 'lib/components/NotFound'
 import { LemonTab, LemonTabs } from 'lib/lemon-ui/LemonTabs'
-import { LogsViewer } from 'scenes/hog-functions/logs/LogsViewer'
+import { useAttachedLogic } from 'lib/logic/scenes/useAttachedLogic'
 import { SceneExport } from 'scenes/sceneTypes'
 import { urls } from 'scenes/urls'
 
 import { SceneContent } from '~/layout/scenes/components/SceneContent'
+import { ProductKey } from '~/queries/schema/schema-general'
 import { ActivityScope } from '~/types'
 
+import { batchWorkflowJobsLogic } from './batchWorkflowJobsLogic'
 import { Workflow } from './Workflow'
+import { workflowLogic } from './workflowLogic'
+import { WorkflowLogs } from './WorkflowLogs'
 import { WorkflowMetrics } from './WorkflowMetrics'
 import { WorkflowSceneHeader } from './WorkflowSceneHeader'
-import { renderWorkflowLogMessage } from './logs/log-utils'
-import { workflowLogic } from './workflowLogic'
 import { WorkflowSceneLogicProps, WorkflowTab, workflowSceneLogic } from './workflowSceneLogic'
 
 export const scene: SceneExport<WorkflowSceneLogicProps> = {
@@ -28,16 +30,29 @@ export const scene: SceneExport<WorkflowSceneLogicProps> = {
         id: id || 'new',
         tab: tab || 'workflow',
     }),
+    productKey: ProductKey.WORKFLOWS,
 }
 
 export function WorkflowScene(props: WorkflowSceneLogicProps): JSX.Element {
-    const { currentTab } = useValues(workflowSceneLogic)
+    const workflowSceneProps: WorkflowSceneLogicProps = {
+        id: props.id || 'new',
+        tab: props.tab || 'workflow',
+        tabId: props.tabId || 'default',
+    }
+    const sceneLogic = workflowSceneLogic(workflowSceneProps)
+    const { currentTab } = useValues(sceneLogic)
     const { searchParams } = useValues(router)
     const templateId = searchParams.templateId as string | undefined
     const editTemplateId = searchParams.editTemplateId as string | undefined
 
-    const logic = workflowLogic({ id: props.id, templateId, editTemplateId })
-    const { workflowLoading, workflow, originalWorkflow } = useValues(logic)
+    const batchJobsLogic = batchWorkflowJobsLogic({ id: workflowSceneProps.id })
+
+    const logic = workflowLogic({ id: props.id, tabId: props.tabId, templateId, editTemplateId })
+    const { workflowLoading, originalWorkflow } = useValues(logic)
+
+    // Attach child logics to the scene logic so they persist across tab switches
+    useAttachedLogic(batchJobsLogic, sceneLogic)
+    useAttachedLogic(logic, sceneLogic)
 
     if (!originalWorkflow && workflowLoading) {
         return <SpinnerOverlay sceneLevel />
@@ -51,24 +66,13 @@ export function WorkflowScene(props: WorkflowSceneLogicProps): JSX.Element {
         {
             label: 'Workflow',
             key: 'workflow',
-            content: <Workflow {...props} />,
+            content: <Workflow {...workflowSceneProps} />,
         },
 
         {
-            label: 'Logs',
+            label: 'Invocations',
             key: 'logs',
-            content: (
-                <LogsViewer
-                    sourceType="hog_flow"
-                    /**
-                     * If we're rendering tabs, props.id is guaranteed to be
-                     * defined and not "new" (see return statement below)
-                     */
-                    sourceId={props.id!}
-                    instanceLabel="workflow run"
-                    renderMessage={(m) => renderWorkflowLogMessage(workflow, m)}
-                />
-            ),
+            content: <WorkflowLogs id={workflowSceneProps.id!} />,
         },
         {
             label: 'Metrics',
@@ -77,7 +81,7 @@ export function WorkflowScene(props: WorkflowSceneLogicProps): JSX.Element {
              * If we're rendering tabs, props.id is guaranteed to be
              * defined and not "new" (see return statement below)
              */
-            content: <WorkflowMetrics id={props.id!} />,
+            content: <WorkflowMetrics id={workflowSceneProps.id!} />,
         },
         {
             label: 'History',
@@ -86,27 +90,29 @@ export function WorkflowScene(props: WorkflowSceneLogicProps): JSX.Element {
              * If we're rendering tabs, props.id is guaranteed to be
              * defined and not "new" (see return statement below)
              */
-            content: <ActivityLog id={props.id!} scope={ActivityScope.HOG_FLOW} />,
+            content: <ActivityLog id={workflowSceneProps.id!} scope={ActivityScope.HOG_FLOW} />,
         },
     ]
 
     return (
-        <SceneContent className="h-full flex flex-col grow">
-            <WorkflowSceneHeader {...props} />
-            {/* Only show Logs and Metrics tabs if the workflow has already been created */}
-            {!props.id || props.id === 'new' ? (
-                <Workflow {...props} />
-            ) : (
-                <LemonTabs
-                    activeKey={currentTab}
-                    onChange={(tab) => router.actions.push(urls.workflow(props.id ?? 'new', tab))}
-                    tabs={tabs}
-                    sceneInset
-                    className={clsx({
-                        'flex flex-col grow [&>div]:flex [&>div]:flex-col [&>div]:grow': currentTab === 'workflow',
-                    })}
-                />
-            )}
+        <SceneContent className="h-full flex flex-col grow" data-attr="workflow-scene">
+            <BindLogic logic={workflowLogic} props={{ id: props.id, tabId: props.tabId, templateId, editTemplateId }}>
+                <WorkflowSceneHeader {...props} />
+                {/* Only show Logs and Metrics tabs if the workflow has already been created */}
+                {!props.id || props.id === 'new' ? (
+                    <Workflow {...props} />
+                ) : (
+                    <LemonTabs
+                        activeKey={currentTab}
+                        onChange={(tab) => router.actions.push(urls.workflow(props.id ?? 'new', tab))}
+                        tabs={tabs}
+                        sceneInset
+                        className={clsx({
+                            'flex flex-col grow [&>div]:flex [&>div]:flex-col [&>div]:grow': currentTab === 'workflow',
+                        })}
+                    />
+                )}
+            </BindLogic>
         </SceneContent>
     )
 }

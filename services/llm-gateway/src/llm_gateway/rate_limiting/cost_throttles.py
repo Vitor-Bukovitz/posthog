@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from abc import abstractmethod
+from typing import TYPE_CHECKING
 
 import structlog
 from redis.asyncio import Redis
 
-from llm_gateway.config import get_settings
+from llm_gateway.config import DEFAULT_USER_COST_LIMIT, get_settings
+
+if TYPE_CHECKING:
+    from llm_gateway.config import UserCostLimit
 from llm_gateway.rate_limiting.redis_limiter import CostRateLimiter
 from llm_gateway.rate_limiting.throttles import Throttle, ThrottleContext, ThrottleResult, get_team_multiplier
 
@@ -118,35 +122,79 @@ class ProductCostThrottle(CostThrottle):
             base_limit = product_config.limit_usd
             window = product_config.window_seconds
         else:
-            base_limit = 20.0
-            window = 3600
+            base_limit = 1000.0
+            window = 86400
         team_mult = self._get_team_multiplier(context)
         return base_limit * team_mult, window
 
 
-class UserCostThrottle(CostThrottle):
-    scope = "user_cost"
+class _UserCostThrottleBase(CostThrottle):
+    """Base for per-product user cost throttles (burst/sustained pattern).
 
-    def _get_limit_exceeded_detail(self) -> str:
-        return "User rate limit exceeded"
+    end_user_id is always the authenticated user's ID, set at context creation.
+
+    If no end_user_id is set, user rate limiting is skipped.
+    If a product is not in user_cost_limits config, default limits are used ($100/24h burst, $1000/30d sustained).
+    """
+
+    _warned_products: set[str] = set()
 
     def _get_cache_key(self, context: ThrottleContext) -> str:
+        if not context.end_user_id:
+            return ""
         team_mult = self._get_team_multiplier(context)
-        base = f"cost:user:{context.user.user_id}"
+        base = f"cost:user:{self.scope}:{context.product}:{context.end_user_id}"
         if team_mult == 1:
             return base
         return f"{base}:tm{team_mult}"
 
-    def _get_limit_and_window(self, context: ThrottleContext) -> tuple[float, int]:
-        settings = get_settings()
-        base_limit = settings.default_user_cost_limit_usd
-        window = settings.default_user_cost_window_seconds
-        team_mult = self._get_team_multiplier(context)
-        return base_limit * team_mult, window
+    def _get_config(self, context: ThrottleContext) -> UserCostLimit:
+        config = get_settings().user_cost_limits.get(context.product)
+        if not config:
+            if context.end_user_id and context.product not in self._warned_products:
+                self._warned_products.add(context.product)
+                logger.info(
+                    "user_cost_limits_using_default",
+                    product=context.product,
+                    message=f"No user_cost_limits config for product '{context.product}' — using default limits",
+                )
+            return DEFAULT_USER_COST_LIMIT
+        return config
 
     async def allow_request(self, context: ThrottleContext) -> ThrottleResult:
-        result = await super().allow_request(context)
+        if not context.end_user_id:
+            return ThrottleResult.allow()
         settings = get_settings()
         if settings.user_cost_limits_disabled:
+            await super().allow_request(context)
             return ThrottleResult.allow()
-        return result
+        return await super().allow_request(context)
+
+    async def record_cost(self, context: ThrottleContext, cost: float) -> None:
+        if not context.end_user_id:
+            return
+        await super().record_cost(context, cost)
+
+
+class UserCostBurstThrottle(_UserCostThrottleBase):
+    scope = "user_cost_burst"
+
+    def _get_limit_exceeded_detail(self) -> str:
+        return "User burst rate limit exceeded"
+
+    def _get_limit_and_window(self, context: ThrottleContext) -> tuple[float, int]:
+        config = self._get_config(context)
+        team_mult = self._get_team_multiplier(context)
+        return config.burst_limit_usd * team_mult, config.burst_window_seconds
+
+
+class UserCostSustainedThrottle(_UserCostThrottleBase):
+    scope = "user_cost_sustained"
+
+    def _get_limit_exceeded_detail(self) -> str:
+        return "User sustained rate limit exceeded"
+
+    def _get_limit_and_window(self, context: ThrottleContext) -> tuple[float, int]:
+        config = self._get_config(context)
+        team_mult = self._get_team_multiplier(context)
+        return config.sustained_limit_usd * team_mult, config.sustained_window_seconds

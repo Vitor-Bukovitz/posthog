@@ -38,7 +38,7 @@ class TestGetS3PathForPartition:
                 datetime(2025, 1, 15),
                 "chunk_0000_run_abc12345",
                 False,
-                "https://posthog-ducklake-dev.s3.us-east-1.amazonaws.com/backfill/events/team_id=mod64eq0/year=2025/month=01/day=15/chunk_0000_run_abc12345.parquet",
+                "https://posthog-ducklake-dev.s3.us-east-1.amazonaws.com/backfill/events/mod64eq0/2025/01/15/chunk_0000_run_abc12345.parquet",
             ),
             (
                 "posthog-ducklake-prod-eu",
@@ -47,7 +47,7 @@ class TestGetS3PathForPartition:
                 datetime(2025, 12, 31),
                 "chunk_0063_run_xyz98765",
                 False,
-                "https://posthog-ducklake-prod-eu.s3.eu-central-1.amazonaws.com/backfill/events/team_id=mod64eq63/year=2025/month=12/day=31/chunk_0063_run_xyz98765.parquet",
+                "https://posthog-ducklake-prod-eu.s3.eu-central-1.amazonaws.com/backfill/events/mod64eq63/2025/12/31/chunk_0063_run_xyz98765.parquet",
             ),
         ]
     )
@@ -86,7 +86,7 @@ class TestGetS3PathForPartition:
             )
             assert (
                 result
-                == "http://localhost:19000/posthog-ducklake-dev/backfill/events/team_id=mod64eq0/year=2025/month=01/day=15/chunk_0000_run_abc12345.parquet"
+                == "http://localhost:19000/posthog-ducklake-dev/backfill/events/mod64eq0/2025/01/15/chunk_0000_run_abc12345.parquet"
             )
 
 
@@ -141,11 +141,17 @@ class TestGetPartitionWhereClause:
 
 class TestEventsColumnsSchema:
     def test_events_columns_has_expected_columns(self):
-        columns_in_sql = {
-            col.strip().split()[0].rstrip(",") for col in EVENTS_COLUMNS.strip().split("\n") if col.strip()
-        }
-        columns_in_sql.discard("toInt64(team_id)")
-        columns_in_sql.add("project_id")
+        columns_in_sql = set()
+        for col in EVENTS_COLUMNS.strip().split("\n"):
+            if col.strip():
+                # Handle columns with 'AS' alias (e.g., "toString(uuid) as uuid")
+                if " as " in col.lower():
+                    # Extract the alias after 'as'
+                    alias = col.lower().split(" as ")[1].split(",")[0].strip()
+                    columns_in_sql.add(alias)
+                else:
+                    # No alias, use the column name directly
+                    columns_in_sql.add(col.strip().split()[0].rstrip(","))
 
         assert "uuid" in columns_in_sql
         assert "event" in columns_in_sql
@@ -184,5 +190,6 @@ class TestEventsColumnsSchema:
             "group4_created_at",
             "person_mode",
             "historical_migration",
+            "_inserted_at",
         }
         assert EXPECTED_DUCKLAKE_COLUMNS == export_columns

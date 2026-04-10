@@ -2,6 +2,7 @@ import { actions, kea, listeners, path, reducers } from 'kea'
 import posthog from 'posthog-js'
 
 import api from 'lib/api'
+import { SetupTaskId, globalSetupLogic } from 'lib/components/ProductSetup'
 import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
 import { BehavioralFilterKey } from 'scenes/cohorts/CohortFilters/types'
 import { createCohortFormData } from 'scenes/cohorts/cohortUtils'
@@ -16,10 +17,12 @@ export const issueActionsLogic = kea<issueActionsLogicType>([
 
     actions({
         mergeIssues: (ids: string[]) => ({ ids }),
-        splitIssue: (id: ErrorTrackingIssue['id'], fingerprints: string[], exclusive: boolean = true) => ({
+        splitIssue: (
+            id: ErrorTrackingIssue['id'],
+            fingerprints: { fingerprint: string; name?: string; description?: string }[]
+        ) => ({
             id,
             fingerprints,
-            exclusive,
         }),
         resolveIssues: (ids: string[]) => ({ ids }),
         suppressIssues: (ids: string[]) => ({ ids }),
@@ -32,6 +35,7 @@ export const issueActionsLogic = kea<issueActionsLogicType>([
         updateIssueDescription: (id: string, description: string) => ({ id, description }),
         createIssueCohort: (id: string, name: string, description: string) => ({ id, name, description }),
 
+        splitIssueSuccess: (newIssueIds: string[]) => ({ newIssueIds }),
         mutationSuccess: (mutationName: string) => ({ mutationName }),
         mutationFailure: (mutationName: string, error: unknown) => ({ mutationName, error }),
         clearNeedsReload: true,
@@ -66,10 +70,11 @@ export const issueActionsLogic = kea<issueActionsLogicType>([
                     })
                 }
             },
-            splitIssue: async ({ id, fingerprints, exclusive }) => {
+            splitIssue: async ({ id, fingerprints }) => {
                 await runMutation('splitIssues', async () => {
                     posthog.capture('error_tracking_issue_split', { issueId: id })
-                    await api.errorTracking.split(id, fingerprints, exclusive)
+                    const response = await api.errorTracking.split(id, fingerprints)
+                    actions.splitIssueSuccess(response.new_issue_ids)
                 })
             },
             resolveIssues: async ({ ids }) => {
@@ -77,6 +82,8 @@ export const issueActionsLogic = kea<issueActionsLogicType>([
                     posthog.capture('error_tracking_issue_bulk_resolve')
                     await api.errorTracking.bulkMarkStatus(ids, 'resolved')
                 })
+
+                globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.ResolveFirstError)
             },
             suppressIssues: async ({ ids }) => {
                 await runMutation('suppressIssues', async () => {

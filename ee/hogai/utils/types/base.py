@@ -22,6 +22,7 @@ from posthog.schema import (
     AssistantFunnelsQuery,
     AssistantGenerationStatusEvent,
     AssistantHogQLQuery,
+    AssistantLifecycleQuery,
     AssistantMessage,
     AssistantRetentionQuery,
     AssistantToolCall,
@@ -93,7 +94,11 @@ AssistantOutput = (
 )
 
 AnyAssistantGeneratedQuery = (
-    AssistantTrendsQuery | AssistantFunnelsQuery | AssistantRetentionQuery | AssistantHogQLQuery
+    AssistantTrendsQuery
+    | AssistantFunnelsQuery
+    | AssistantLifecycleQuery
+    | AssistantRetentionQuery
+    | AssistantHogQLQuery
 )
 AnyPydanticModelQuery = TypeVar("AnyPydanticModelQuery", bound=BaseModel)
 
@@ -117,6 +122,32 @@ ASSISTANT_MESSAGE_TYPES = (
 
 def replace(_: Any | None, right: Any | None) -> Any | None:
     return right
+
+
+def replace_if_not_none(left: Any | None, right: Any | None) -> Any | None:
+    """Replace the left value with right only if right is not None."""
+    return right if right is not None else left
+
+
+# String sentinel for clearing supermode - must be a string for msgpack serialization
+CLEAR_SUPERMODE: str = "__CLEAR_SUPERMODE__"
+
+
+def replace_supermode(left: AgentMode | str | None, right: AgentMode | str | None) -> AgentMode | None:
+    """Replace supermode with special handling for explicit clearing.
+
+    - If right is CLEAR_SUPERMODE string, returns None (explicit clear)
+    - If right is an AgentMode, returns right (explicit set)
+    - If right is None, returns left (no change)
+    """
+    if right == CLEAR_SUPERMODE:
+        return None
+    result = right if right is not None else left
+    # CLEAR_SUPERMODE should only appear on the right side (incoming update)
+    # If it's in left (current state), that's a bug - treat as None
+    if result == CLEAR_SUPERMODE:
+        return None
+    return result  # type: ignore[return-value]
 
 
 def append(left: Sequence, right: Sequence) -> Sequence:
@@ -281,9 +312,14 @@ class BaseStateWithMessages(BaseState):
     """
     Messages exposed to the user.
     """
-    agent_mode: AgentMode | None = Field(default=None)
+    agent_mode: Annotated[AgentMode | None, replace_if_not_none] = Field(default=None)
     """
     The mode of the agent.
+    """
+    supermode: Annotated[AgentMode | str | None, replace_supermode] = Field(default=None)
+    """
+    The supermode of the agent (e.g., PLAN, RESEARCH).
+    Use CLEAR_SUPERMODE string to explicitly clear the supermode.
     """
 
     @field_validator("messages", mode="after")
@@ -329,7 +365,12 @@ class BaseStateWithMessages(BaseState):
 
     @property
     def agent_mode_or_default(self) -> AgentMode:
-        return self.agent_mode or AgentMode.PRODUCT_ANALYTICS
+        # EXECUTION is a fictitious transition mode - treat as default
+        if self.agent_mode is None or (self.agent_mode in [AgentMode.EXECUTION, AgentMode.RESEARCH]):
+            return AgentMode.PRODUCT_ANALYTICS
+        if self.agent_mode == AgentMode.PLAN:
+            return AgentMode.SQL
+        return self.agent_mode
 
 
 class BaseStateWithTasks(BaseState):
@@ -524,6 +565,7 @@ class AssistantGraphName(StrEnum):
     INSIGHTS = "insights_graph"
     TAXONOMY = "taxonomy_graph"
     DEEP_RESEARCH = "deep_research_graph"
+    SUPPORT = "support_graph"
 
 
 class AssistantMode(StrEnum):
@@ -566,7 +608,14 @@ class UpdateAction(BaseModel):
     content: str | AssistantToolCall
 
 
-AssistantActionUnion = MessageAction | MessageChunkAction | NodeStartAction | NodeEndAction | UpdateAction
+class ConversationTitleAction(BaseModel):
+    type: Literal["CONVERSATION_TITLE"] = "CONVERSATION_TITLE"
+    title: str
+
+
+AssistantActionUnion = (
+    MessageAction | MessageChunkAction | NodeStartAction | NodeEndAction | UpdateAction | ConversationTitleAction
+)
 
 
 class NodePath(BaseModel):

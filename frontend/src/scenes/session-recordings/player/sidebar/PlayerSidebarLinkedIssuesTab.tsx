@@ -21,15 +21,20 @@ import { urls } from 'scenes/urls'
 import { IntegrationKind, IntegrationType, SessionRecordingExternalReference } from '~/types'
 
 import { sessionRecordingPlayerLogic } from '../sessionRecordingPlayerLogic'
-import { createGitHubIssueForm, createGitLabIssueForm, createLinearIssueForm } from './issueFormHelpers'
+import {
+    createGitHubIssueForm,
+    createGitLabIssueForm,
+    createJiraIssueForm,
+    createLinearIssueForm,
+} from './issueFormHelpers'
 
-const SESSION_REPLAY_INTEGRATIONS: IntegrationKind[] = ['linear', 'github', 'gitlab']
+const SESSION_REPLAY_INTEGRATIONS: IntegrationKind[] = ['linear', 'github', 'gitlab', 'jira']
 
 type IssueConfig = Record<string, string>
 
 const IntegrationIcon = ({ kind }: { kind: IntegrationKind }): JSX.Element => {
     const className = kind === 'github' ? 'w-5 h-5 rounded-sm dark:invert' : 'w-5 h-5 rounded-sm'
-    return <img src={ICONS[kind]} className={className} />
+    return <img src={ICONS[kind]} alt={`${kind} integration`} className={className} />
 }
 
 export function PlayerSidebarLinkedIssuesTab(): JSX.Element | null {
@@ -70,12 +75,15 @@ export function PlayerSidebarLinkedIssuesTab(): JSX.Element | null {
             createGitHubIssueForm(sessionRecordingId, integration, submitHandler)
         } else if (integration.kind === 'gitlab') {
             createGitLabIssueForm(sessionRecordingId, integration, submitHandler)
+        } else if (integration.kind === 'jira') {
+            createJiraIssueForm(sessionRecordingId, integration, submitHandler)
         }
     }
 
     const linearReferences = externalReferences.filter((ref) => ref.integration.kind === 'linear')
     const githubReferences = externalReferences.filter((ref) => ref.integration.kind === 'github')
     const gitlabReferences = externalReferences.filter((ref) => ref.integration.kind === 'gitlab')
+    const jiraReferences = externalReferences.filter((ref) => ref.integration.kind === 'jira')
 
     const renderIssueLink = (reference: SessionRecordingExternalReference): JSX.Element => (
         <Link
@@ -95,6 +103,9 @@ export function PlayerSidebarLinkedIssuesTab(): JSX.Element | null {
                     <span className="font-medium flex-shrink-0">{reference.issue_id}</span>
                     {reference.metadata?.repository && (
                         <span className="text-xs text-muted flex-shrink-0">[{reference.metadata.repository}]</span>
+                    )}
+                    {reference.metadata?.project && (
+                        <span className="text-xs text-muted flex-shrink-0">[{reference.metadata.project}]</span>
                     )}
                     {reference.title && <span className="text-sm text-muted truncate">{reference.title}</span>}
                 </div>
@@ -123,6 +134,12 @@ export function PlayerSidebarLinkedIssuesTab(): JSX.Element | null {
                         <div className="space-y-2">
                             <h4 className="text-sm font-medium text-muted">GitLab</h4>
                             {gitlabReferences.map(renderIssueLink)}
+                        </div>
+                    )}
+                    {jiraReferences.length > 0 && (
+                        <div className="space-y-2">
+                            <h4 className="text-sm font-medium text-muted">Jira</h4>
+                            {jiraReferences.map(renderIssueLink)}
                         </div>
                     )}
                 </>

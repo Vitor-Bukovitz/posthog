@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::async_trait;
+use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 
 use sha2::{Digest, Sha512};
@@ -16,9 +16,10 @@ use crate::{
         SYMBOL_SET_FETCH_RETRY, SYMBOL_SET_SAVED,
     },
     posthog_utils::{capture_symbol_set_deleted, capture_symbol_set_saved},
+    symbol_store::BlobClient,
 };
 
-use super::{Fetcher, Parser, S3Client};
+use super::{Fetcher, Parser};
 
 const MAX_REF_BYTES: usize = 2048;
 
@@ -40,7 +41,7 @@ fn truncate_ref(s: &str) -> &str {
 // source bytes into s3, and the storage pointer into a postgres database.
 pub struct Saving<F> {
     inner: F,
-    s3_client: Arc<S3Client>,
+    s3_client: Arc<dyn BlobClient>,
     pool: PgPool,
     bucket: String,
     prefix: String,
@@ -75,7 +76,7 @@ impl<F> Saving<F> {
     pub fn new(
         inner: F,
         pool: sqlx::PgPool,
-        s3_client: Arc<S3Client>,
+        s3_client: Arc<dyn BlobClient>,
         bucket: String,
         prefix: String,
     ) -> Self {
@@ -181,18 +182,17 @@ where
         info!("Fetching symbol set data for {}", set_ref);
         metrics::counter!(SYMBOL_SET_DB_FETCHES).increment(1);
 
-        if let Some(record) = SymbolSetRecord::load(&self.pool, team_id, &set_ref).await? {
+        if let Some(mut record) = SymbolSetRecord::load(&self.pool, team_id, &set_ref).await? {
             metrics::counter!(SYMBOL_SET_DB_HITS).increment(1);
-            if let Some(storage_ptr) = &record.storage_ptr {
+            if let Some(storage_ptr) = record.storage_ptr.clone() {
                 info!("Found s3 saved symbol set data for {}", set_ref);
-                let data = match self.s3_client.get(&self.bucket, storage_ptr).await {
+                record.set_last_used(&self.pool).await?;
+                let data = match self.s3_client.get(&self.bucket, &storage_ptr).await {
                     Ok(Some(data)) => data,
                     Ok(None) => {
                         warn!("Storage pointer points to a record that doesn't exist");
-                        // If the storage pointer points to a record that doesn't exist, delete the record and treat it as a frame error
-                        let mut record = record;
                         record.delete(&self.pool).await?;
-                        return Err(FrameError::MissingChunkIdData(record.set_ref).into());
+                        return Err(FrameError::MissingChunkIdData(set_ref).into());
                     }
                     // Otherwise, if we just failed to talk to s3 for some reason, treat it as an unhandled error, and die
                     Err(err) => return Err(err.into()),
@@ -200,11 +200,14 @@ where
                 metrics::counter!(SAVED_SYMBOL_SET_LOADED).increment(1);
                 return Ok(Saveable {
                     data,
-                    storage_ptr: Some(storage_ptr.clone()),
+                    storage_ptr: Some(storage_ptr),
                     team_id,
                     set_ref,
                 });
-            } else if Utc::now() - record.created_at < chrono::Duration::days(1) {
+            } else if record
+                .last_used
+                .is_some_and(|l| Utc::now() - l < chrono::Duration::days(1))
+            {
                 info!("Found recent symbol set error for {}", set_ref);
                 // We tried less than a day ago to get the set data, and failed, so bail out
                 // with the stored error. We unwrap here because we should never store a "no set"
@@ -293,7 +296,7 @@ impl SymbolSetRecord {
         // unfound symbol set) or if they have a content hash (indicating a full saved symbol set). The in-between
         // states (storage_ptr is not null AND content_hash is null) indicate an ongoing upload.
         let truncated_ref = truncate_ref(set_ref);
-        let mut record = sqlx::query_as!(
+        let record = sqlx::query_as!(
             SymbolSetRecord,
             r#"SELECT id, team_id, ref as set_ref, storage_ptr, created_at, failure_reason, content_hash, last_used
             FROM posthog_errortrackingsymbolset
@@ -304,16 +307,12 @@ impl SymbolSetRecord {
         .fetch_optional(pool)
         .await?;
 
-        if let Some(r) = &mut record {
-            r.set_last_used(pool).await?;
-        }
-
         Ok(record)
     }
 
-    // Set the last used timestamp. This isn't used anywhere in cymbal right now, but is
+    // Set the last used timestamp. Called on successful symbol set lookups, and also
     // used by retention cleanup jobs to determine which symbol sets are still in use.
-    async fn set_last_used<'c, E>(&mut self, e: E) -> Result<(), UnhandledError>
+    pub(crate) async fn set_last_used<'c, E>(&mut self, e: E) -> Result<(), UnhandledError>
     where
         E: sqlx::Executor<'c, Database = sqlx::Postgres>,
     {
@@ -352,9 +351,9 @@ impl SymbolSetRecord {
         let truncated_ref = truncate_ref(&self.set_ref);
         self.id = sqlx::query_scalar!(
             r#"
-            INSERT INTO posthog_errortrackingsymbolset (id, team_id, ref, storage_ptr, failure_reason, created_at, content_hash)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (team_id, ref) DO UPDATE SET storage_ptr = $4, content_hash = $7, failure_reason = $5
+            INSERT INTO posthog_errortrackingsymbolset (id, team_id, ref, storage_ptr, failure_reason, created_at, content_hash, last_used)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (team_id, ref) DO UPDATE SET storage_ptr = $4, content_hash = $7, failure_reason = $5, last_used = $8
             RETURNING id
             "#,
             self.id,
@@ -363,7 +362,8 @@ impl SymbolSetRecord {
             self.storage_ptr,
             self.failure_reason,
             self.created_at,
-            self.content_hash
+            self.content_hash,
+            self.last_used
         )
         .fetch_one(e)
         .await.expect("Got at least one row back");
@@ -407,7 +407,7 @@ mod test {
         symbol_store::{
             saving::{truncate_ref, Saving, SymbolSetRecord, MAX_REF_BYTES},
             sourcemap::SourcemapProvider,
-            Provider, S3Client,
+            MockS3Client, Provider,
         },
     };
 
@@ -473,7 +473,7 @@ mod test {
             then.status(200).body(MAP);
         });
 
-        let mut client = S3Client::default();
+        let mut client = MockS3Client::default();
         // Expected: we'll hit the backend and store the data in s3.
         client
             .expect_put()
@@ -530,7 +530,7 @@ mod test {
         });
 
         // We don't expect any S3 operations since we won't get any valid data
-        let client = S3Client::default();
+        let client = MockS3Client::default();
 
         let smp = SourcemapProvider::new(&config);
         let saving_smp = Saving::new(
@@ -580,7 +580,7 @@ mod test {
         });
 
         // We don't expect any S3 operations since we won't get any valid data
-        let client = S3Client::default();
+        let client = MockS3Client::default();
 
         let smp = SourcemapProvider::new(&config);
         let saving_smp = Saving::new(

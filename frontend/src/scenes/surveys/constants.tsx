@@ -41,6 +41,7 @@ export const QUESTION_TYPE_OPTIONS = [
 
 // Rating scale constants
 export const SURVEY_RATING_SCALE = {
+    THUMB_2_POINT: 2,
     EMOJI_3_POINT: 3,
     LIKERT_5_POINT: 5,
     LIKERT_7_POINT: 7,
@@ -169,37 +170,37 @@ export const defaultSurveyFieldValues = {
     },
 }
 
-export interface NewSurvey
-    extends Pick<
-        Survey,
-        | 'name'
-        | 'description'
-        | 'type'
-        | 'conditions'
-        | 'questions'
-        | 'start_date'
-        | 'end_date'
-        | 'linked_flag'
-        | 'targeting_flag'
-        | 'archived'
-        | 'appearance'
-        | 'targeting_flag_filters'
-        | 'responses_limit'
-        | 'iteration_count'
-        | 'iteration_frequency_days'
-        | 'iteration_start_dates'
-        | 'current_iteration'
-        | 'response_sampling_start_date'
-        | 'response_sampling_interval_type'
-        | 'response_sampling_interval'
-        | 'response_sampling_limit'
-        | 'schedule'
-        | 'enable_partial_responses'
-        | 'enable_iframe_embedding'
-        | 'user_access_level'
-        | 'headline_summary'
-        | 'headline_response_count'
-    > {
+export interface NewSurvey extends Pick<
+    Survey,
+    | 'name'
+    | 'description'
+    | 'type'
+    | 'conditions'
+    | 'questions'
+    | 'start_date'
+    | 'end_date'
+    | 'linked_flag'
+    | 'targeting_flag'
+    | 'archived'
+    | 'appearance'
+    | 'targeting_flag_filters'
+    | 'responses_limit'
+    | 'iteration_count'
+    | 'iteration_frequency_days'
+    | 'iteration_start_dates'
+    | 'current_iteration'
+    | 'response_sampling_start_date'
+    | 'response_sampling_interval_type'
+    | 'response_sampling_interval'
+    | 'response_sampling_limit'
+    | 'schedule'
+    | 'enable_partial_responses'
+    | 'enable_iframe_embedding'
+    | 'user_access_level'
+    | 'headline_summary'
+    | 'headline_response_count'
+    | 'form_content'
+> {
     id: 'new'
     linked_flag_id: number | null
 }
@@ -234,6 +235,7 @@ export const NEW_SURVEY: NewSurvey = {
     iteration_frequency_days: null,
     enable_partial_responses: true,
     user_access_level: AccessControlLevel.Editor,
+    form_content: null,
 }
 
 export enum SurveyTemplateType {
@@ -656,6 +658,7 @@ export const SURVEY_TYPE_LABEL_MAP = {
 export const LOADING_SURVEY_RESULTS_TOAST_ID = 'survey-results-loading'
 
 export const SCALE_LABELS: Record<SurveyRatingScaleValue, string> = {
+    [SURVEY_RATING_SCALE.THUMB_2_POINT]: '1-2 (thumbs up/down)',
     [SURVEY_RATING_SCALE.EMOJI_3_POINT]: '1 - 3',
     [SURVEY_RATING_SCALE.LIKERT_5_POINT]: '1 - 5',
     [SURVEY_RATING_SCALE.LIKERT_7_POINT]: '1 - 7',
@@ -664,6 +667,7 @@ export const SCALE_LABELS: Record<SurveyRatingScaleValue, string> = {
 
 export const SCALE_OPTIONS = {
     EMOJI: [
+        { label: SCALE_LABELS[SURVEY_RATING_SCALE.THUMB_2_POINT], value: SURVEY_RATING_SCALE.THUMB_2_POINT },
         { label: SCALE_LABELS[SURVEY_RATING_SCALE.EMOJI_3_POINT], value: SURVEY_RATING_SCALE.EMOJI_3_POINT },
         { label: SCALE_LABELS[SURVEY_RATING_SCALE.LIKERT_5_POINT], value: SURVEY_RATING_SCALE.LIKERT_5_POINT },
     ],
@@ -684,12 +688,14 @@ export enum SURVEY_CREATED_SOURCE {
     FEATURE_FLAGS = 'feature_flags',
     MAX_AI = 'max_ai',
     SURVEY_FORM = 'survey_form',
+    SURVEY_WIZARD = 'survey_wizard',
     SURVEY_EMPTY_STATE = 'survey_empty_state',
     EXPERIMENTS = 'experiments',
     INSIGHT_CROSS_SELL = 'insight_cross_sell',
     CUSTOMER_ANALYTICS_INSIGHT = 'customer_analytics_insight',
     ERROR_TRACKING = 'error_tracking',
     WEB_ANALYTICS = 'web_analytics',
+    LLM_ANALYTICS = 'llm_analytics',
 }
 
 export enum SURVEY_FORM_INPUT_IDS {
@@ -798,3 +804,17 @@ export const surveyThemes: SurveyTheme[] = [
         },
     },
 ]
+
+export function getMatchingSurveyThemeId(appearance?: Partial<SurveyAppearance> | null): string | null {
+    if (!appearance) {
+        return 'clean'
+    }
+
+    const matchingTheme = surveyThemes.find(
+        (theme) =>
+            theme.appearance.backgroundColor === appearance.backgroundColor &&
+            theme.appearance.submitButtonColor === appearance.submitButtonColor
+    )
+
+    return matchingTheme?.id ?? null
+}

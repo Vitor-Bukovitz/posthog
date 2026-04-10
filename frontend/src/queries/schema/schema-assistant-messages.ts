@@ -1,25 +1,31 @@
 import type { MaxBillingContext } from 'scenes/max/maxBillingContextLogic'
 import type { MaxUIContext } from 'scenes/max/maxTypes'
 
-import type { Category, NotebookInfo } from '~/types'
-import type { InsightShortId } from '~/types'
+import type { Category, InsightShortId, NotebookInfo } from '~/types'
 
+// eslint-disable-next-line import/no-cycle
 import { DocumentBlock } from './schema-assistant-artifacts'
 import type {
     AssistantFunnelsQuery,
     AssistantHogQLQuery,
+    AssistantLifecycleQuery,
+    AssistantPathsQuery,
     AssistantRetentionQuery,
+    AssistantStickinessQuery,
     AssistantTrendsQuery,
 } from './schema-assistant-queries'
 import type {
     FunnelsQuery,
     HogQLQuery,
+    LifecycleQuery,
+    PathsQuery,
     QuerySchema,
     RetentionQuery,
     RevenueAnalyticsGrossRevenueQuery,
     RevenueAnalyticsMRRQuery,
     RevenueAnalyticsMetricsQuery,
     RevenueAnalyticsTopCustomersQuery,
+    StickinessQuery,
     TrendsQuery,
 } from './schema-general'
 
@@ -104,25 +110,85 @@ export interface AssistantForm {
 }
 
 export interface MultiQuestionFormQuestionOption {
-    /** The value to use when this option is selected */
+    /** A short value to use when this option is selected, in a few words */
     value: string
+    /** A longer description of the option, in one short sentence */
+    description?: string
+}
+
+/** Question types: select/multi_select for standalone, multi_field for composite */
+export type MultiQuestionFormQuestionType = 'select' | 'multi_select' | 'multi_field'
+
+/** Field types allowed inside a multi_field composite question */
+export type MultiQuestionFormFieldType = 'text' | 'number' | 'slider' | 'dropdown' | 'toggle'
+
+export interface MultiQuestionFormField {
+    /** Unique identifier for this field, used as the answer key */
+    id: string
+    /** Field type (required, no default) */
+    type: MultiQuestionFormFieldType
+    /** Label displayed above/beside the field */
+    label: string
+    /** Available answer options (required for dropdown) */
+    options?: MultiQuestionFormQuestionOption[]
+    /** Minimum value (for number and slider types) */
+    min?: number
+    /** Maximum value (for number and slider types) */
+    max?: number
+    /** Step size (for number and slider types) */
+    step?: number
+    /** Placeholder text (for text and number types) */
+    placeholder?: string
+    /** Whether this field can be left empty (default: false) */
+    optional?: boolean
 }
 
 export interface MultiQuestionFormQuestion {
     /** Unique identifier for this question */
     id: string
+    /** One word title for the question e.g. "Use case", "Team size", "Experience" */
+    title: string
     /** The question text to display */
     question: string
-    /** Available answer options */
-    options: MultiQuestionFormQuestionOption[]
-    /** Whether to show a "Type your answer" option (default: true) */
+    /**
+     * Question type. Use 'multi_field' with fields array for composite questions.
+     * @default select
+     */
+    type?: MultiQuestionFormQuestionType
+    /** Available answer options (required for select and multi_select) */
+    options?: MultiQuestionFormQuestionOption[]
+    /** Whether to show a "Type your answer" option (default: true). Only used for select type. */
     allow_custom_answer?: boolean
+    /** Fields for multi_field type questions, grouped with a shared submit button */
+    fields?: MultiQuestionFormField[]
+}
+
+export interface MultiQuestionFormAnswers {
+    [questionId: string]: string | string[]
 }
 
 export interface MultiQuestionForm {
     /** The questions to ask */
     questions: MultiQuestionFormQuestion[]
 }
+
+export interface ApprovalResumePayload {
+    action: 'approve' | 'reject'
+    proposal_id: string
+    feedback?: string
+    payload?: Record<string, unknown>
+}
+
+export interface FormResumePayload {
+    action: 'form'
+    form_answers: MultiQuestionFormAnswers
+}
+
+export interface FormDismissPayload {
+    action: 'dismiss_form'
+}
+
+export type ResumePayload = ApprovalResumePayload | FormResumePayload | FormDismissPayload
 
 export interface AssistantMessageMetadata {
     form?: AssistantForm
@@ -177,6 +243,9 @@ export type AnyAssistantGeneratedQuery =
     | AssistantTrendsQuery
     | AssistantFunnelsQuery
     | AssistantRetentionQuery
+    | AssistantStickinessQuery
+    | AssistantPathsQuery
+    | AssistantLifecycleQuery
     | AssistantHogQLQuery
 
 export interface VisualizationItem {
@@ -188,6 +257,9 @@ export interface VisualizationItem {
         | TrendsQuery
         | FunnelsQuery
         | RetentionQuery
+        | StickinessQuery
+        | PathsQuery
+        | LifecycleQuery
         | HogQLQuery
         | RevenueAnalyticsGrossRevenueQuery
         | RevenueAnalyticsMetricsQuery
@@ -286,6 +358,8 @@ export interface NotebookArtifactContent {
     blocks: DocumentBlock[]
     /** Title for the notebook */
     title?: string | null
+    /** Whether this notebook has been saved to the database (not stored, set during enrichment) */
+    is_saved?: boolean
 }
 
 export type ArtifactContent = VisualizationArtifactContent | NotebookArtifactContent
@@ -321,6 +395,7 @@ export enum AssistantEventType {
     Notebook = 'notebook',
     Update = 'update',
     Approval = 'approval',
+    Sandbox = 'sandbox',
 }
 
 export interface AssistantUpdateEvent {
@@ -350,7 +425,7 @@ export interface AssistantToolCallMessage extends BaseAssistantMessage {
      * Payload passed through to the frontend - specifically for calls of contextual tool.
      * Tool call messages without a ui_payload are not passed through to the frontend.
      */
-    ui_payload?: Record<string, any>
+    ui_payload?: Record<string, any> | null
     content: string
     tool_call_id: string
 }
@@ -369,7 +444,7 @@ export interface DangerousOperationResponse {
 
 export type ApprovalDecisionStatus = 'pending' | 'approved' | 'rejected' | 'auto_rejected'
 
-export type ApprovalCardUIStatus = ApprovalDecisionStatus | 'approving' | 'rejecting'
+export type ApprovalCardUIStatus = ApprovalDecisionStatus | 'approving' | 'rejecting' | 'custom'
 
 export type AssistantTool =
     | 'search_session_recordings'
@@ -383,10 +458,10 @@ export type AssistantTool =
     | 'search_error_tracking_issues'
     | 'find_error_tracking_impactful_issue_event_list'
     | 'experiment_results_summary'
+    | 'experiment_session_replays_summary'
     | 'create_survey'
+    | 'edit_survey'
     | 'analyze_survey_responses'
-    | 'create_dashboard'
-    | 'edit_current_dashboard'
     | 'read_taxonomy'
     | 'search'
     | 'read_data'
@@ -414,12 +489,24 @@ export type AssistantTool =
     | 'manage_memories'
     | 'create_notebook'
     | 'list_data'
+    | 'upsert_alert'
+    | 'finalize_plan'
+    | 'call_mcp_server'
+    | 'search_llm_traces'
+    | 'run_hog_eval_test'
 
 export enum AgentMode {
     ProductAnalytics = 'product_analytics',
     SQL = 'sql',
     SessionReplay = 'session_replay',
     ErrorTracking = 'error_tracking',
+    Plan = 'plan',
+    Execution = 'execution',
+    Survey = 'survey',
+    Research = 'research',
+    Flags = 'flags',
+    LLMAnalytics = 'llm_analytics',
+    Sandbox = 'sandbox',
 }
 
 export enum SlashCommandName {
@@ -470,7 +557,6 @@ export enum AssistantNavigateUrl {
     Settings = 'settings',
     SqlEditor = 'sqlEditor',
     Surveys = 'surveys',
-    SurveyTemplates = 'surveyTemplates',
     ToolbarLaunch = 'toolbarLaunch',
     WebAnalytics = 'webAnalytics',
     WebAnalyticsWebVitals = 'webAnalyticsWebVitals',

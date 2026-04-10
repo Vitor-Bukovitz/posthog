@@ -4,6 +4,7 @@ import { beforeUnload } from 'kea-router'
 
 import { lemonToast } from '@posthog/lemon-ui'
 
+import { SetupTaskId, globalSetupLogic } from 'lib/components/ProductSetup'
 import { dayjs } from 'lib/dayjs'
 import { objectsEqual } from 'lib/utils'
 import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
@@ -308,27 +309,80 @@ export const revenueAnalyticsSettingsLogic = kea<revenueAnalyticsSettingsLogicTy
         ],
     }),
     listeners(({ actions, values }) => {
-        const updateCurrentTeam = (): void => {
-            if (values.revenueAnalyticsConfig) {
-                actions.updateCurrentTeam({ revenue_analytics_config: values.revenueAnalyticsConfig })
-                lemonToast.success('Revenue analytics config saved')
-            }
-        }
-
         return {
-            addGoal: updateCurrentTeam,
-            deleteGoal: updateCurrentTeam,
-            updateGoal: updateCurrentTeam,
-            save: updateCurrentTeam,
+            addGoal: () => {
+                if (values.revenueAnalyticsConfig) {
+                    actions.updateCurrentTeam({
+                        revenue_analytics_config: {
+                            ...values.revenueAnalyticsConfig,
+                            goals: values.revenueAnalyticsConfig.goals,
+                        },
+                    })
+                    lemonToast.success('Revenue analytics config saved')
+                }
+                globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.SetUpRevenueGoal)
+            },
+            deleteGoal: () => {
+                if (values.revenueAnalyticsConfig) {
+                    actions.updateCurrentTeam({
+                        revenue_analytics_config: {
+                            ...values.revenueAnalyticsConfig,
+                            goals: values.revenueAnalyticsConfig.goals,
+                        },
+                    })
+                    lemonToast.success('Revenue analytics config saved')
+                }
+            },
+            updateGoal: () => {
+                if (values.revenueAnalyticsConfig) {
+                    actions.updateCurrentTeam({
+                        revenue_analytics_config: {
+                            ...values.revenueAnalyticsConfig,
+                            goals: values.revenueAnalyticsConfig.goals,
+                        },
+                    })
+                    lemonToast.success('Revenue analytics config saved')
+                }
+            },
+            save: () => {
+                if (values.revenueAnalyticsConfig) {
+                    actions.updateCurrentTeam({
+                        revenue_analytics_config: {
+                            ...values.revenueAnalyticsConfig,
+                            events: values.revenueAnalyticsConfig.events,
+                        },
+                    })
+                    lemonToast.success('Revenue analytics config saved')
+                }
+
+                // Mark ConnectRevenueSource as completed when saving with events configured
+                if ((values.revenueAnalyticsConfig?.events?.length ?? 0) > 0) {
+                    globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.ConnectRevenueSource)
+                }
+            },
             updateFilterTestAccounts: ({ filterTestAccounts }) => {
-                updateCurrentTeam()
-                actions.reportRevenueAnalyticsTestAccountFilterUpdated(filterTestAccounts)
+                if (values.revenueAnalyticsConfig) {
+                    actions.updateCurrentTeam({
+                        revenue_analytics_config: {
+                            ...values.revenueAnalyticsConfig,
+                            filter_test_accounts: filterTestAccounts,
+                        },
+                    })
+                    lemonToast.success('Revenue analytics config saved')
+                    actions.reportRevenueAnalyticsTestAccountFilterUpdated(filterTestAccounts)
+                }
             },
             deleteEvent: ({ eventName }) => actions.reportRevenueAnalyticsEventDeleted(eventName),
             updateSourceRevenueAnalyticsConfig: ({ source, config }) => {
                 const func = config.enabled
                     ? actions.reportRevenueAnalyticsDataSourceEnabled
                     : actions.reportRevenueAnalyticsDataSourceDisabled
+
+                // Mark ConnectRevenueSource as completed when enabling a data source
+                if (config.enabled) {
+                    globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.ConnectRevenueSource)
+                }
+
                 return func(source.source_type)
             },
         }

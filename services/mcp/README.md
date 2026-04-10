@@ -155,31 +155,168 @@ This approach allows you to use the PostHog MCP server without needing Node.js o
 
 ### Example Prompts
 
-- What feature flags do I have active?
-- Add a new feature flag for our homepage redesign
-- What are my most common errors?
-- Show me my LLM costs this week
+Below are detailed examples showing realistic prompts and expected outputs:
+
+#### Example 1: Feature flag management
+
+**Prompt:** "Create a feature flag called 'new-checkout-flow' that's enabled for 20% of users, and show me the configuration"
+
+**What happens:**
+
+1. The `create-feature-flag` tool creates the flag with a 20% rollout
+2. Returns the flag configuration including the key, rollout percentage, and targeting rules
+
+**Expected output:**
+
+```text
+Created feature flag 'new-checkout-flow':
+- Key: new-checkout-flow
+- Active: true
+- Rollout: 20% of all users
+- URL: https://app.posthog.com/feature_flags/12345
+```
+
+#### Example 2: Analytics query
+
+**Prompt:** "How many unique users signed up in the last 7 days, broken down by day?"
+
+**What happens:**
+
+1. The `query-run` tool executes a trends query filtering for `$signup` events
+2. Returns daily counts with unique user aggregation
+
+**Expected output:**
+
+```text
+Signups over the last 7 days:
+
+| Date       | Unique users |
+|------------|--------------|
+| 2025-01-17 | 142          |
+| 2025-01-18 | 156          |
+| 2025-01-19 | 98           |
+| ...        | ...          |
+
+Total: 847 unique signups
+```
+
+#### Example 3: A/B test creation and monitoring
+
+**Prompt:** "Create an A/B test for our pricing page that measures conversion to the checkout page"
+
+**What happens:**
+
+1. The `experiment-create` tool creates an experiment with control/test variants
+2. Sets up a funnel metric: pricing page view → checkout page view
+3. Creates an associated feature flag for variant assignment
+
+**Expected output:**
+
+```text
+Created experiment 'Pricing page test':
+- Feature flag: pricing-page-test
+- Variants: control (50%), test (50%)
+- Primary metric: Funnel conversion (pricing_page → checkout)
+- Status: Draft (ready to launch)
+- URL: https://app.posthog.com/experiments/789
+```
+
+#### Example 4: Error investigation
+
+**Prompt:** "What are the top 5 errors in my project this week and how many users are affected?"
+
+**What happens:**
+
+1. The `query-error-tracking-issues` tool fetches error groups sorted by occurrence count
+2. Returns error details including affected user counts
+
+**Expected output:**
+
+```text
+Top 5 errors this week:
+
+1. TypeError: Cannot read property 'id' of undefined
+   - Occurrences: 1,247
+   - Users affected: 89
+   - First seen: 2 days ago
+
+2. NetworkError: Failed to fetch
+   - Occurrences: 856
+   - Users affected: 234
+   - First seen: 5 days ago
+...
+```
+
+#### Quick prompts
+
+For simpler queries, you can use shorter prompts:
+
+- "What feature flags do I have active?"
+- "Show me my LLM costs this week"
+- "List my dashboards"
+- "What events are being tracked?"
 
 ### Feature Filtering
 
-You can limit which tools are available by adding query parameters to the MCP URL:
+You can limit which tools are available by adding query parameters to the MCP URL. If no features are specified, all tools are available. When features are specified, only tools matching those features are exposed.
 
 ```text
-https://mcp.posthog.com/mcp?features=flags,workspace
+https://mcp.posthog.com/mcp?features=flags,workspace,dashboards
 ```
 
 Available features:
 
-- `workspace` - Organization and project management
-- `error-tracking` - [Error monitoring and debugging](https://posthog.com/docs/errors)
-- `dashboards` - [Dashboard creation and management](https://posthog.com/docs/product-analytics/dashboards)
-- `insights` - [Analytics insights and SQL queries](https://posthog.com/docs/product-analytics/insights)
-- `experiments` - [A/B testing experiments](https://posthog.com/docs/experiments)
-- `flags` - [Feature flag management](https://posthog.com/docs/feature-flags)
-- `llm-analytics` - [LLM usage and cost tracking](https://posthog.com/docs/llm-analytics)
-- `docs` - PostHog documentation search
+| Feature                  | Description                                                                                               |
+| ------------------------ | --------------------------------------------------------------------------------------------------------- |
+| `workspace`              | Organization and project management                                                                       |
+| `actions`                | [Action definitions](https://posthog.com/docs/data/actions)                                               |
+| `activity_logs`          | Activity log viewing                                                                                      |
+| `alerts`                 | [Alert management](https://posthog.com/docs/product-analytics/alerts)                                     |
+| `annotations`            | [Annotation management](https://posthog.com/docs/product-analytics/annotations)                           |
+| `cohorts`                | [Cohort management](https://posthog.com/docs/data/cohorts)                                                |
+| `dashboards`             | [Dashboard creation and management](https://posthog.com/docs/product-analytics/dashboards)                |
+| `data_schema`            | Data schema exploration                                                                                   |
+| `data_warehouse`         | [Data warehouse management](https://posthog.com/docs/data-warehouse)                                      |
+| `debug`                  | Debug and diagnostic tools                                                                                |
+| `docs`                   | PostHog documentation search                                                                              |
+| `early_access_features`  | [Early access feature management](https://posthog.com/docs/feature-flags/early-access-feature-management) |
+| `error_tracking`         | [Error monitoring and debugging](https://posthog.com/docs/error-tracking)                                 |
+| `events`                 | Event and property definitions                                                                            |
+| `experiments`            | [A/B testing experiments](https://posthog.com/docs/experiments)                                           |
+| `flags`                  | [Feature flag management](https://posthog.com/docs/feature-flags)                                         |
+| `hog_functions`          | [CDP function management](https://posthog.com/docs/cdp)                                                   |
+| `hog_function_templates` | CDP function template browsing                                                                            |
+| `insights`               | [Analytics insights](https://posthog.com/docs/product-analytics/insights)                                 |
+| `llm_analytics`          | [LLM analytics evaluations](https://posthog.com/docs/ai-engineering)                                      |
+| `prompts`                | [LLM prompt management](https://posthog.com/docs/ai-engineering)                                          |
+| `logs`                   | [Log querying](https://posthog.com/docs/ai-engineering/observability)                                     |
+| `notebooks`              | [Notebook management](https://posthog.com/docs/notebooks)                                                 |
+| `persons`                | [Person and group management](https://posthog.com/docs/data/persons)                                      |
+| `reverse_proxy`          | Reverse proxy record management                                                                           |
+| `search`                 | Entity search across the project                                                                          |
+| `sql`                    | SQL query execution                                                                                       |
+| `surveys`                | [Survey management](https://posthog.com/docs/surveys)                                                     |
+| `workflows`              | [Workflow management](https://posthog.com/docs/cdp)                                                       |
 
-To view which tools are available per feature, see our [documentation](https://posthog.com/docs/model-context-protocol) or alternatively check out `schema/tool-definitions.json`,
+> **Note:** Hyphens and underscores are treated as equivalent in feature names (e.g., `error-tracking` and `error_tracking` both work).
+
+To view which tools are available per feature, see our [documentation](https://posthog.com/docs/model-context-protocol) or check `schema/tool-definitions-all.json`.
+
+### Tool filtering
+
+For finer-grained control you can allowlist specific tools by name using the `tools` query parameter. Only the exact tool names listed will be exposed, regardless of their feature category.
+
+```text
+https://mcp.posthog.com/mcp?tools=dashboard-get,feature-flag-get-all,execute-sql
+```
+
+When `features` and `tools` are both provided they are combined as a **union** — a tool is included if it matches a feature category **or** is in the tools list. This lets you select a feature group and add a handful of individual tools on top:
+
+```text
+https://mcp.posthog.com/mcp?features=flags&tools=dashboard-get
+```
+
+The example above exposes all flag tools plus `dashboard-get`.
 
 ### Data processing
 
@@ -203,7 +340,7 @@ And replace `https://mcp.posthog.com/mcp` with `http://localhost:8787/mcp` in th
 
 To develop with warm loading for MCP resources (workflows, prompts, examples):
 
-1. Start the [examples](https://github.com/postHog/examples) dev server: `cd ../examples && npm run dev`
+1. Start the [context-mill](https://github.com/PostHog/context-mill) dev server: `cd ../context-mill && npm run dev`
 2. Start the MCP server with local resources: `pnpm run dev:local-resources`
 
 Changes in the examples repo will be reflected on the next request.
@@ -259,3 +396,31 @@ npx
 ```bash
 -y mcp-remote@latest http://localhost:8787/mcp --header "Authorization: Bearer {INSERT_YOUR_PERSONAL_API_KEY_HERE}"
 ```
+
+### Developing against Claude Desktop
+
+Claude Desktop is one of the easiest ways to test MCP Apps - while PostHog Code doesn't support it. You can configure access Settings > Developer and then edit `claude_desktop_config.json` with the following:
+
+```json
+{
+  "mcpServers": {
+    "posthog-local": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote@latest", "http://localhost:8787/mcp"]
+    }
+  }
+}
+```
+
+## Privacy & Support
+
+- **Privacy Policy:** https://posthog.com/privacy
+- **Terms of Service:** https://posthog.com/terms
+- **Support:** https://posthog.com/questions or email support@posthog.com
+- **GitHub Issues:** https://github.com/PostHog/posthog/issues
+
+### Data handling
+
+The MCP server acts as a proxy to your PostHog instance. It does not store your analytics data - all queries are executed against your PostHog project and results are returned directly to your AI client. Session state (active project/organization) is cached temporarily using Cloudflare Durable Objects tied to your API key hash.
+
+For EU users, use the `mcp-eu.posthog.com` endpoint to ensure OAuth flows route to the EU PostHog instance.

@@ -5,7 +5,7 @@ from typing import Optional
 from django.conf import settings
 from django.db import models
 from django.db.models import Q
-from django.http import HttpResponse
+from django.http import HttpResponse, HttpResponseRedirect
 from django.utils.text import slugify
 from django.utils.timezone import now
 
@@ -67,7 +67,7 @@ class ExportedAsset(models.Model):
 
     # Relations
     team = models.ForeignKey("Team", on_delete=models.CASCADE)
-    dashboard = models.ForeignKey("posthog.Dashboard", on_delete=models.CASCADE, null=True)
+    dashboard = models.ForeignKey("dashboards.Dashboard", on_delete=models.CASCADE, null=True)
     insight = models.ForeignKey("posthog.Insight", on_delete=models.CASCADE, null=True)
 
     # Content related fields
@@ -138,6 +138,10 @@ class ExportedAsset(models.Model):
         elif self.insight:
             filename = f"{filename}-{slugify(self.insight.name or self.insight.derived_name)}"
 
+        timestamp = self.created_at.strftime("%Y-%m-%d-%H%M%S") if self.created_at else ""
+        if timestamp:
+            filename = f"{filename}-{timestamp}"
+
         filename = f"{filename}.{ext}"
 
         return filename
@@ -145,6 +149,19 @@ class ExportedAsset(models.Model):
     @property
     def file_ext(self):
         return self.export_format.split("/")[1]
+
+    @property
+    def export_type(self) -> str:
+        if self.insight_id is not None:
+            return "insight"
+        if self.dashboard_id is not None:
+            return "dashboard"
+        ctx = self.export_context or {}
+        if ctx.get("session_recording_id"):
+            return "recording"
+        if ctx.get("heatmap_url"):
+            return "heatmap"
+        return "unknown"
 
     def get_analytics_metadata(self):
         return {
@@ -187,12 +204,18 @@ def asset_for_token(token: str) -> ExportedAsset:
 
 
 def get_content_response(asset: ExportedAsset, download: bool = False):
-    content = asset.content
-    if not content and asset.content_location:
-        content = object_storage.read_bytes(asset.content_location)
+    if asset.content_location:
+        content_disposition = f'attachment; filename="{asset.filename}"' if download else None
+        presigned_url = object_storage.get_presigned_url(
+            asset.content_location,
+            content_type=asset.export_format,
+            content_disposition=content_disposition,
+        )
+        if presigned_url:
+            return HttpResponseRedirect(presigned_url)
 
+    content = asset.content
     if not content:
-        # Don't modify the asset here as the task might still be running concurrently
         raise NotFound()
 
     res = HttpResponse(content, content_type=asset.export_format)
@@ -253,8 +276,21 @@ def _get_object_path(exported_asset: ExportedAsset) -> str:
 
 
 def save_content_from_file(exported_asset: ExportedAsset, file_path: str) -> None:
-    """Save content by streaming from a file to S3."""
-    object_path = _get_object_path(exported_asset)
-    object_storage.write_from_file(object_path, file_path)
-    exported_asset.content_location = object_path
-    exported_asset.save(update_fields=["content_location"])
+    """Save content from a file to object storage, with fallback to storing in the database."""
+    try:
+        if settings.OBJECT_STORAGE_ENABLED:
+            object_path = _get_object_path(exported_asset)
+            object_storage.write_from_file(object_path, file_path)
+            exported_asset.content_location = object_path
+            exported_asset.save(update_fields=["content_location"])
+            return
+    except ObjectStorageError as ose:
+        capture_exception(ose)
+        logger.error(
+            "exported_asset.object-storage-error",
+            exported_asset_id=exported_asset.id,
+            exception=ose,
+            exc_info=True,
+        )
+    with open(file_path, "rb") as f:
+        save_content_to_exported_asset(exported_asset, f.read())

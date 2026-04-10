@@ -13,8 +13,9 @@ use tracing::{error, instrument, Span};
 
 use crate::{
     api::CaptureError,
-    debug_or_info,
-    prometheus::report_dropped_events,
+    debug_or_info, error_tracking_sampler,
+    event_restrictions::{EventContext as RestrictionEventContext, EventRestrictionService},
+    prometheus::{report_clock_skew, report_dropped_events},
     router, sinks,
     utils::uuid_v7,
     v0_request::{DataType, ProcessedEvent, ProcessedEventMetadata, ProcessingContext},
@@ -36,6 +37,10 @@ pub fn process_single_event(
 
     let data_type = match (event.event.as_str(), context.historical_migration) {
         ("$$client_ingestion_warning", _) => DataType::ClientIngestionWarning,
+        ("$exception", _) if error_tracking_sampler::should_route_to_node() => {
+            metrics::counter!("capture_exception_events_routed_to_node").increment(1);
+            DataType::ExceptionErrorTracking
+        }
         ("$exception", _) => DataType::ExceptionMain,
         ("$$heatmap", _) => DataType::HeatmapMain,
         (_, true) => DataType::AnalyticsHistorical,
@@ -50,7 +55,7 @@ pub fn process_single_event(
     };
 
     let data = serde_json::to_string(&event).map_err(|e| {
-        error!("failed to encode data field: {}", e);
+        error!("failed to encode data field: {e:#}");
         CaptureError::NonRetryableSinkError
     })?;
 
@@ -65,24 +70,31 @@ pub fn process_single_event(
         .unwrap_or(false);
 
     // Parse the event timestamp
-    let computed_timestamp = common_types::timestamp::parse_event_timestamp(
+    let parsed_timestamp = common_types::timestamp::parse_event_timestamp(
         event.timestamp.as_deref(),
         event.offset,
         sent_at_utc,
         ignore_sent_at,
         context.now,
     );
+    if let Some(skew) = parsed_timestamp.clock_skew {
+        report_clock_skew(skew);
+    }
 
     let event_name = event.event.clone();
 
     let mut metadata = ProcessedEventMetadata {
         data_type,
         session_id: None,
-        computed_timestamp: Some(computed_timestamp),
+        computed_timestamp: Some(parsed_timestamp.timestamp),
         event_name: event_name.clone(),
+        force_overflow: false,
+        skip_person_processing: false,
+        redirect_to_dlq: false,
+        redirect_to_topic: None,
     };
 
-    if historical_cfg.should_reroute(metadata.data_type, computed_timestamp) {
+    if historical_cfg.should_reroute(metadata.data_type, parsed_timestamp.timestamp) {
         metrics::counter!(
             "capture_events_rerouted_historical",
             &[("reason", "timestamp")]
@@ -105,7 +117,7 @@ pub fn process_single_event(
         sent_at: context.sent_at,
         token: context.token.clone(),
         event: event_name,
-        timestamp: computed_timestamp,
+        timestamp: parsed_timestamp.timestamp,
         is_cookieless_mode: event
             .extract_is_cookieless_mode()
             .ok_or(CaptureError::InvalidCookielessMode)?,
@@ -120,6 +132,7 @@ pub fn process_single_event(
 pub async fn process_events<'a>(
     sink: Arc<dyn sinks::Event + Send + Sync>,
     dropper: Arc<TokenDropper>,
+    restriction_service: Option<EventRestrictionService>,
     historical_cfg: router::HistoricalConfig,
     events: &'a [RawEvent],
     context: &'a ProcessingContext,
@@ -145,7 +158,48 @@ pub async fn process_events<'a>(
         }
     });
 
-    debug_or_info!(chatty_debug_enabled, context=?context, event_count=?events.len(), "filtered ProcessedEvents batch");
+    debug_or_info!(chatty_debug_enabled, context=?context, event_count=?events.len(), "filtered by token_dropper");
+
+    // Apply event restrictions if service is configured
+    if let Some(ref service) = restriction_service {
+        let mut filtered_events = Vec::with_capacity(events.len());
+        let now_ts = context.now.timestamp();
+
+        for e in events {
+            let uuid_str = e.event.uuid.to_string();
+            let event_ctx = RestrictionEventContext {
+                distinct_id: Some(&e.event.distinct_id),
+                session_id: e.event.session_id.as_deref(),
+                event_name: Some(&e.event.event),
+                event_uuid: Some(&uuid_str),
+                now_ts,
+            };
+
+            let applied = service.get_restrictions(&e.event.token, &event_ctx).await;
+
+            if applied.should_drop() {
+                report_dropped_events("event_restriction_drop", 1);
+                continue;
+            }
+
+            let mut event = e;
+            event.metadata.force_overflow |= applied.force_overflow();
+            event.metadata.skip_person_processing |= applied.skip_person_processing();
+            event.metadata.redirect_to_dlq |= applied.redirect_to_dlq();
+            if let Some(topic) = applied.redirect_to_topic() {
+                event.metadata.redirect_to_topic = Some(topic.to_string());
+            }
+
+            filtered_events.push(event);
+        }
+
+        events = filtered_events;
+        debug_or_info!(chatty_debug_enabled, context=?context, event_count=?events.len(), "filtered by event_restrictions");
+    }
+
+    if events.is_empty() {
+        return Ok(());
+    }
 
     if events.len() == 1 {
         sink.send(events[0].clone()).await?;
@@ -192,6 +246,15 @@ mod tests {
         offset: Option<i64>,
         ignore_sent_at: Option<bool>,
     ) -> RawEvent {
+        create_test_event_with_name("test_event", timestamp, offset, ignore_sent_at)
+    }
+
+    fn create_test_event_with_name(
+        event_name: &str,
+        timestamp: Option<String>,
+        offset: Option<i64>,
+        ignore_sent_at: Option<bool>,
+    ) -> RawEvent {
         let mut properties = HashMap::new();
         if let Some(ignore) = ignore_sent_at {
             properties.insert("$ignore_sent_at".to_string(), json!(ignore));
@@ -201,7 +264,7 @@ mod tests {
         RawEvent {
             uuid: Some(uuid_v7()),
             distinct_id: None,
-            event: "test_event".to_string(),
+            event: event_name.to_string(),
             properties,
             timestamp,
             offset,
@@ -321,5 +384,455 @@ mod tests {
 
         assert!(processed.event.historical_migration);
         assert_eq!(processed.metadata.data_type, DataType::AnalyticsHistorical);
+    }
+
+    // Mock sink for testing process_events with restrictions
+    use crate::config::CaptureMode;
+    use crate::event_restrictions::{
+        EventRestrictionService, Restriction, RestrictionFilters, RestrictionManager,
+        RestrictionScope, RestrictionType,
+    };
+    use crate::sinks;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    struct MockSink {
+        events: Arc<Mutex<Vec<ProcessedEvent>>>,
+    }
+
+    impl MockSink {
+        fn new() -> Self {
+            Self {
+                events: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn get_events(&self) -> Vec<ProcessedEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl sinks::Event for MockSink {
+        async fn send(&self, event: ProcessedEvent) -> Result<(), crate::api::CaptureError> {
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+
+        async fn send_batch(
+            &self,
+            events: Vec<ProcessedEvent>,
+        ) -> Result<(), crate::api::CaptureError> {
+            self.events.lock().unwrap().extend(events);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_events_drop_event_restriction() {
+        let now = DateTime::parse_from_rfc3339("2023-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let context = create_test_context(now, None);
+        let events = vec![create_test_event(
+            Some("2023-01-01T11:00:00Z".to_string()),
+            None,
+            None,
+        )];
+
+        let sink = Arc::new(MockSink::new());
+        let dropper = Arc::new(limiters::token_dropper::TokenDropper::default());
+        let historical_cfg = router::HistoricalConfig::new(false, 1);
+
+        // Create restriction service with DropEvent
+        let service = EventRestrictionService::new(CaptureMode::Events, Duration::from_secs(300));
+        let mut manager = RestrictionManager::new();
+        manager.restrictions.insert(
+            "test_token".to_string(),
+            vec![Restriction {
+                restriction_type: RestrictionType::DropEvent,
+                scope: RestrictionScope::AllEvents,
+                args: None,
+            }],
+        );
+        service.update(manager).await;
+
+        let result = process_events(
+            sink.clone(),
+            dropper,
+            Some(service),
+            historical_cfg,
+            &events,
+            &context,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        // Event should be dropped
+        assert_eq!(sink.get_events().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_process_events_force_overflow_restriction() {
+        let now = DateTime::parse_from_rfc3339("2023-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let context = create_test_context(now, None);
+        let events = vec![create_test_event(
+            Some("2023-01-01T11:00:00Z".to_string()),
+            None,
+            None,
+        )];
+
+        let sink = Arc::new(MockSink::new());
+        let dropper = Arc::new(limiters::token_dropper::TokenDropper::default());
+        let historical_cfg = router::HistoricalConfig::new(false, 1);
+
+        // Create restriction service with ForceOverflow
+        let service = EventRestrictionService::new(CaptureMode::Events, Duration::from_secs(300));
+        let mut manager = RestrictionManager::new();
+        manager.restrictions.insert(
+            "test_token".to_string(),
+            vec![Restriction {
+                restriction_type: RestrictionType::ForceOverflow,
+                scope: RestrictionScope::AllEvents,
+                args: None,
+            }],
+        );
+        service.update(manager).await;
+
+        let result = process_events(
+            sink.clone(),
+            dropper,
+            Some(service),
+            historical_cfg,
+            &events,
+            &context,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let captured = sink.get_events();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].metadata.force_overflow);
+    }
+
+    #[tokio::test]
+    async fn test_process_events_skip_person_processing_restriction() {
+        let now = DateTime::parse_from_rfc3339("2023-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let context = create_test_context(now, None);
+        let events = vec![create_test_event(
+            Some("2023-01-01T11:00:00Z".to_string()),
+            None,
+            None,
+        )];
+
+        let sink = Arc::new(MockSink::new());
+        let dropper = Arc::new(limiters::token_dropper::TokenDropper::default());
+        let historical_cfg = router::HistoricalConfig::new(false, 1);
+
+        // Create restriction service with SkipPersonProcessing
+        let service = EventRestrictionService::new(CaptureMode::Events, Duration::from_secs(300));
+        let mut manager = RestrictionManager::new();
+        manager.restrictions.insert(
+            "test_token".to_string(),
+            vec![Restriction {
+                restriction_type: RestrictionType::SkipPersonProcessing,
+                scope: RestrictionScope::AllEvents,
+                args: None,
+            }],
+        );
+        service.update(manager).await;
+
+        let result = process_events(
+            sink.clone(),
+            dropper,
+            Some(service),
+            historical_cfg,
+            &events,
+            &context,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let captured = sink.get_events();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].metadata.skip_person_processing);
+    }
+
+    #[tokio::test]
+    async fn test_process_events_redirect_to_dlq_restriction() {
+        let now = DateTime::parse_from_rfc3339("2023-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let context = create_test_context(now, None);
+        let events = vec![create_test_event(
+            Some("2023-01-01T11:00:00Z".to_string()),
+            None,
+            None,
+        )];
+
+        let sink = Arc::new(MockSink::new());
+        let dropper = Arc::new(limiters::token_dropper::TokenDropper::default());
+        let historical_cfg = router::HistoricalConfig::new(false, 1);
+
+        // Create restriction service with RedirectToDlq
+        let service = EventRestrictionService::new(CaptureMode::Events, Duration::from_secs(300));
+        let mut manager = RestrictionManager::new();
+        manager.restrictions.insert(
+            "test_token".to_string(),
+            vec![Restriction {
+                restriction_type: RestrictionType::RedirectToDlq,
+                scope: RestrictionScope::AllEvents,
+                args: None,
+            }],
+        );
+        service.update(manager).await;
+
+        let result = process_events(
+            sink.clone(),
+            dropper,
+            Some(service),
+            historical_cfg,
+            &events,
+            &context,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let captured = sink.get_events();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].metadata.redirect_to_dlq);
+    }
+
+    #[tokio::test]
+    async fn test_process_events_multiple_restrictions() {
+        let now = DateTime::parse_from_rfc3339("2023-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let context = create_test_context(now, None);
+        let events = vec![create_test_event(
+            Some("2023-01-01T11:00:00Z".to_string()),
+            None,
+            None,
+        )];
+
+        let sink = Arc::new(MockSink::new());
+        let dropper = Arc::new(limiters::token_dropper::TokenDropper::default());
+        let historical_cfg = router::HistoricalConfig::new(false, 1);
+
+        // Create restriction service with multiple restrictions
+        let service = EventRestrictionService::new(CaptureMode::Events, Duration::from_secs(300));
+        let mut manager = RestrictionManager::new();
+        manager.restrictions.insert(
+            "test_token".to_string(),
+            vec![
+                Restriction {
+                    restriction_type: RestrictionType::ForceOverflow,
+                    scope: RestrictionScope::AllEvents,
+                    args: None,
+                },
+                Restriction {
+                    restriction_type: RestrictionType::SkipPersonProcessing,
+                    scope: RestrictionScope::AllEvents,
+                    args: None,
+                },
+            ],
+        );
+        service.update(manager).await;
+
+        let result = process_events(
+            sink.clone(),
+            dropper,
+            Some(service),
+            historical_cfg,
+            &events,
+            &context,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let captured = sink.get_events();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].metadata.force_overflow);
+        assert!(captured[0].metadata.skip_person_processing);
+    }
+
+    #[tokio::test]
+    async fn test_process_events_no_restriction_service() {
+        let now = DateTime::parse_from_rfc3339("2023-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let context = create_test_context(now, None);
+        let events = vec![create_test_event(
+            Some("2023-01-01T11:00:00Z".to_string()),
+            None,
+            None,
+        )];
+
+        let sink = Arc::new(MockSink::new());
+        let dropper = Arc::new(limiters::token_dropper::TokenDropper::default());
+        let historical_cfg = router::HistoricalConfig::new(false, 1);
+
+        // No restriction service
+        let result = process_events(
+            sink.clone(),
+            dropper,
+            None,
+            historical_cfg,
+            &events,
+            &context,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let captured = sink.get_events();
+        assert_eq!(captured.len(), 1);
+        assert!(!captured[0].metadata.force_overflow);
+        assert!(!captured[0].metadata.skip_person_processing);
+        assert!(!captured[0].metadata.redirect_to_dlq);
+        assert!(captured[0].metadata.redirect_to_topic.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_process_events_filtered_restriction() {
+        let now = DateTime::parse_from_rfc3339("2023-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let context = create_test_context(now, None);
+        let events = vec![create_test_event(
+            Some("2023-01-01T11:00:00Z".to_string()),
+            None,
+            None,
+        )];
+
+        let sink = Arc::new(MockSink::new());
+        let dropper = Arc::new(limiters::token_dropper::TokenDropper::default());
+        let historical_cfg = router::HistoricalConfig::new(false, 1);
+
+        // Create restriction that only applies to different event name
+        let service = EventRestrictionService::new(CaptureMode::Events, Duration::from_secs(300));
+        let mut manager = RestrictionManager::new();
+        let mut filters = RestrictionFilters::default();
+        filters.event_names.insert("$pageview".to_string()); // our event is "test_event"
+        manager.restrictions.insert(
+            "test_token".to_string(),
+            vec![Restriction {
+                restriction_type: RestrictionType::DropEvent,
+                scope: RestrictionScope::Filtered(filters),
+                args: None,
+            }],
+        );
+        service.update(manager).await;
+
+        let result = process_events(
+            sink.clone(),
+            dropper,
+            Some(service),
+            historical_cfg,
+            &events,
+            &context,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        // Event should NOT be dropped because filter doesn't match
+        let captured = sink.get_events();
+        assert_eq!(captured.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_process_events_exception_node_rollout() {
+        // Initialize the error tracking sampler at 100% to route all exceptions to Node.
+        // Note: OnceLock means this only succeeds once per test binary, so this test
+        // assumes no other test initializes the sampler first.
+        crate::error_tracking_sampler::init(true, 100.0);
+
+        let now = DateTime::parse_from_rfc3339("2023-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let context = create_test_context(now, None);
+        let events = vec![create_test_event_with_name(
+            "$exception",
+            Some("2023-01-01T11:00:00Z".to_string()),
+            None,
+            None,
+        )];
+
+        let sink = Arc::new(MockSink::new());
+        let dropper = Arc::new(limiters::token_dropper::TokenDropper::default());
+        let historical_cfg = router::HistoricalConfig::new(false, 1);
+
+        let service = EventRestrictionService::new(CaptureMode::Events, Duration::from_secs(300));
+
+        let result = process_events(
+            sink.clone(),
+            dropper,
+            Some(service),
+            historical_cfg,
+            &events,
+            &context,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let captured = sink.get_events();
+
+        // At 100% rollout, the exception should be routed to Node (ExceptionErrorTracking)
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].metadata.data_type,
+            DataType::ExceptionErrorTracking
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_events_redirect_to_topic_restriction() {
+        let now = DateTime::parse_from_rfc3339("2023-01-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let context = create_test_context(now, None);
+        let events = vec![create_test_event(
+            Some("2023-01-01T11:00:00Z".to_string()),
+            None,
+            None,
+        )];
+
+        let sink = Arc::new(MockSink::new());
+        let dropper = Arc::new(limiters::token_dropper::TokenDropper::default());
+        let historical_cfg = router::HistoricalConfig::new(false, 1);
+
+        let service = EventRestrictionService::new(CaptureMode::Events, Duration::from_secs(300));
+        let mut manager = RestrictionManager::new();
+        manager.restrictions.insert(
+            "test_token".to_string(),
+            vec![Restriction {
+                restriction_type: RestrictionType::RedirectToTopic,
+                scope: RestrictionScope::AllEvents,
+                args: Some(json!({"topic": "custom_events_topic"})),
+            }],
+        );
+        service.update(manager).await;
+
+        let result = process_events(
+            sink.clone(),
+            dropper,
+            Some(service),
+            historical_cfg,
+            &events,
+            &context,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let captured = sink.get_events();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].metadata.redirect_to_topic,
+            Some("custom_events_topic".to_string())
+        );
     }
 }

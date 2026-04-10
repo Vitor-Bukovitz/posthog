@@ -18,8 +18,22 @@ describe('clustersTabContentLogic', () => {
         title: 'Test Cluster',
         description: 'Test description',
         traces: {
-            'trace-123': { distance_to_centroid: 0.1, rank: 0, x: 0.0, y: 0.0, timestamp: '2025-01-05T10:00:00Z' },
-            'trace-456': { distance_to_centroid: 0.2, rank: 1, x: 0.1, y: 0.1, timestamp: '2025-01-05T11:00:00Z' },
+            'trace-123': {
+                distance_to_centroid: 0.1,
+                rank: 0,
+                x: 0.0,
+                y: 0.0,
+                timestamp: '2025-01-05T10:00:00Z',
+                trace_id: 'trace-123',
+            },
+            'trace-456': {
+                distance_to_centroid: 0.2,
+                rank: 1,
+                x: 0.1,
+                y: 0.1,
+                timestamp: '2025-01-05T11:00:00Z',
+                trace_id: 'trace-456',
+            },
         },
         centroid: [1.0],
         centroid_x: 0.05,
@@ -32,7 +46,14 @@ describe('clustersTabContentLogic', () => {
         title: 'Outliers',
         description: 'Noise points',
         traces: {
-            'trace-789': { distance_to_centroid: 0.9, rank: 0, x: 5.0, y: 5.0, timestamp: '2025-01-05T12:00:00Z' },
+            'trace-789': {
+                distance_to_centroid: 0.9,
+                rank: 0,
+                x: 5.0,
+                y: 5.0,
+                timestamp: '2025-01-05T12:00:00Z',
+                trace_id: 'trace-789',
+            },
         },
         centroid: [],
         centroid_x: 5.0,
@@ -43,7 +64,7 @@ describe('clustersTabContentLogic', () => {
 
     beforeEach(() => {
         initKeaTests()
-        jest.clearAllMocks()
+        jest.resetAllMocks()
     })
 
     afterEach(() => {
@@ -54,14 +75,14 @@ describe('clustersTabContentLogic', () => {
 
     describe('initialization', () => {
         it('uses traceId as key', () => {
-            mockApi.queryHogQL = jest.fn().mockResolvedValue({ results: [] })
+            mockApi.queryHogQL.mockResolvedValue({ results: [] })
 
             logic = clustersTabContentLogic({ traceId: 'trace-123' })
             expect(logic.key).toBe('trace-123')
         })
 
         it('loads clusters on mount', async () => {
-            mockApi.queryHogQL = jest.fn().mockResolvedValue({ results: [] })
+            mockApi.queryHogQL.mockResolvedValue({ results: [] })
 
             logic = clustersTabContentLogic({ traceId: 'trace-123' })
             logic.mount()
@@ -75,7 +96,7 @@ describe('clustersTabContentLogic', () => {
     describe('loaders', () => {
         describe('loadClusters', () => {
             it('returns empty array when no results', async () => {
-                mockApi.queryHogQL = jest.fn().mockResolvedValue({ results: [] })
+                mockApi.queryHogQL.mockResolvedValue({ results: [] })
 
                 logic = clustersTabContentLogic({ traceId: 'trace-123' })
                 logic.mount()
@@ -86,7 +107,7 @@ describe('clustersTabContentLogic', () => {
             })
 
             it('finds clusters containing the trace', async () => {
-                mockApi.queryHogQL = jest.fn().mockResolvedValue({
+                mockApi.queryHogQL.mockResolvedValue({
                     results: [['run-1', JSON.stringify([mockCluster]), '2025-01-05T10:00:00Z']],
                 })
 
@@ -106,7 +127,7 @@ describe('clustersTabContentLogic', () => {
             })
 
             it('identifies outlier clusters correctly', async () => {
-                mockApi.queryHogQL = jest.fn().mockResolvedValue({
+                mockApi.queryHogQL.mockResolvedValue({
                     results: [['run-1', JSON.stringify([mockOutlierCluster]), '2025-01-05T12:00:00Z']],
                 })
 
@@ -121,7 +142,7 @@ describe('clustersTabContentLogic', () => {
 
             it('uses default title when cluster title is empty', async () => {
                 const clusterWithoutTitle = { ...mockCluster, title: '' }
-                mockApi.queryHogQL = jest.fn().mockResolvedValue({
+                mockApi.queryHogQL.mockResolvedValue({
                     results: [['run-1', JSON.stringify([clusterWithoutTitle]), '2025-01-05T10:00:00Z']],
                 })
 
@@ -134,7 +155,7 @@ describe('clustersTabContentLogic', () => {
             })
 
             it('ignores clusters that do not contain the trace', async () => {
-                mockApi.queryHogQL = jest.fn().mockResolvedValue({
+                mockApi.queryHogQL.mockResolvedValue({
                     results: [['run-1', JSON.stringify([mockCluster]), '2025-01-05T10:00:00Z']],
                 })
 
@@ -147,7 +168,7 @@ describe('clustersTabContentLogic', () => {
             })
 
             it('finds traces across multiple runs', async () => {
-                mockApi.queryHogQL = jest.fn().mockResolvedValue({
+                mockApi.queryHogQL.mockResolvedValue({
                     results: [
                         ['run-1', JSON.stringify([mockCluster]), '2025-01-05T10:00:00Z'],
                         ['run-2', JSON.stringify([mockCluster]), '2025-01-06T10:00:00Z'],
@@ -165,7 +186,7 @@ describe('clustersTabContentLogic', () => {
             })
 
             it('handles malformed JSON gracefully', async () => {
-                mockApi.queryHogQL = jest.fn().mockResolvedValue({
+                mockApi.queryHogQL.mockResolvedValue({
                     results: [
                         ['run-1', 'not valid json', '2025-01-05T10:00:00Z'],
                         ['run-2', JSON.stringify([mockCluster]), '2025-01-06T10:00:00Z'],
@@ -183,7 +204,7 @@ describe('clustersTabContentLogic', () => {
             })
 
             it('handles null clusters JSON gracefully', async () => {
-                mockApi.queryHogQL = jest.fn().mockResolvedValue({
+                mockApi.queryHogQL.mockResolvedValue({
                     results: [['run-1', null, '2025-01-05T10:00:00Z']],
                 })
 
@@ -199,7 +220,7 @@ describe('clustersTabContentLogic', () => {
 
     describe('keyed logic instances', () => {
         it('creates separate instances for different traceIds', async () => {
-            mockApi.queryHogQL = jest.fn().mockResolvedValue({ results: [] })
+            mockApi.queryHogQL.mockResolvedValue({ results: [] })
 
             const logic1 = clustersTabContentLogic({ traceId: 'trace-1' })
             const logic2 = clustersTabContentLogic({ traceId: 'trace-2' })

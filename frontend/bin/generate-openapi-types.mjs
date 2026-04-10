@@ -6,6 +6,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { collectSchemaRefs, preprocessSchema, resolveNestedRefs, runOrvalParallel } from '@posthog/openapi-codegen'
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const frontendRoot = path.resolve(__dirname, '..')
 const repoRoot = path.resolve(frontendRoot, '..')
@@ -28,24 +30,21 @@ if (!fs.existsSync(schemaPath)) {
 const generateAll = process.argv.includes('--all')
 
 /**
- * Load products.json and build mappings for tag → product routing.
+ * Load product mappings for routing endpoints to output directories.
  *
  * Returns:
- * - knownProducts: Set of all valid product names from products.json (whitelist)
- * - intentToProduct: Map of intent (tag) → product name
  * - productFoldersOnDisk: Set of product folder names that exist in products/
+ * - validatedRequestViewSets: Set of ViewSet snake_case names that use @validated_request
  */
 function loadProductMappings() {
     const productFoldersOnDisk = discoverProductFolders()
+    const validatedRequestViewSets = buildValidatedRequestViewSets()
 
-    // Tags should match folder names directly (e.g., @extend_schema(tags=["replay"]))
-    // No need for complex intent mapping - just use folder names as the source of truth
-    return { productFoldersOnDisk }
+    return { productFoldersOnDisk, validatedRequestViewSets }
 }
 
 /**
  * Discover product folders that are ready for TypeScript types.
- * A product is ready if it has a package.json (indicating it's a proper TS package).
  */
 function discoverProductFolders() {
     const products = new Set()
@@ -55,6 +54,84 @@ function discoverProductFolders() {
         }
     }
     return products
+}
+
+/**
+ * Scan posthog/api/ and ee/ for ViewSets that use @validated_request decorator.
+ * These endpoints should be included in core even without explicit tags.
+ * Returns: Set of ViewSet snake_case names
+ */
+function buildValidatedRequestViewSets() {
+    const viewSets = new Set()
+    const dirsToScan = [path.join(repoRoot, 'posthog', 'api'), path.join(repoRoot, 'ee')]
+
+    for (const dir of dirsToScan) {
+        if (!fs.existsSync(dir)) {
+            continue
+        }
+
+        const pyFiles = findPythonFiles(dir)
+
+        for (const pyFile of pyFiles) {
+            try {
+                const content = fs.readFileSync(pyFile, 'utf-8')
+
+                // Check if file uses @validated_request
+                if (!content.includes('@validated_request')) {
+                    continue
+                }
+
+                // Find all ViewSet classes in this file (case insensitive)
+                const viewSetRegex = /class\s+(\w+ViewSet)[\s(]/gi
+                let match
+                while ((match = viewSetRegex.exec(content)) !== null) {
+                    const viewSetName = match[1]
+                    const snakeCase = viewSetName
+                        .replace(/ViewSet$/i, '')
+                        .replace(/([A-Z])([A-Z][a-z])/g, '$1_$2')
+                        .replace(/([a-z])([A-Z])/g, '$1_$2')
+                        .toLowerCase()
+                    viewSets.add(snakeCase)
+                }
+            } catch (err) {
+                if (err.code !== 'ENOENT' && err.code !== 'EACCES') {
+                    console.warn(`Warning: scanning ${pyFile}:`, err.message)
+                }
+            }
+        }
+    }
+
+    return viewSets
+}
+
+/**
+ * Recursively find all .py files in a directory
+ */
+function findPythonFiles(dir) {
+    const files = []
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const fullPath = path.join(dir, entry.name)
+        if (entry.isDirectory() && !entry.name.startsWith('__')) {
+            files.push(...findPythonFiles(fullPath))
+        } else if (entry.isFile() && entry.name.endsWith('.py')) {
+            files.push(fullPath)
+        }
+    }
+    return files
+}
+
+/**
+ * Match URL path to a product folder name.
+ * Fallback for endpoints that might not be tagged.
+ */
+function matchUrlToProduct(urlPath, productFolders) {
+    const urlLower = urlPath.toLowerCase().replace(/-/g, '_')
+    for (const product of productFolders) {
+        if (urlLower.includes(`/${product}/`)) {
+            return product
+        }
+    }
+    return null
 }
 
 /**
@@ -100,55 +177,25 @@ function createTempDir() {
     return fs.mkdtempSync(path.join(os.tmpdir(), 'openapi-split-'))
 }
 
-function collectSchemaRefs(obj, refs = new Set()) {
-    if (!obj || typeof obj !== 'object') {
-        return refs
-    }
-    if (obj.$ref && typeof obj.$ref === 'string') {
-        refs.add(obj.$ref)
-    }
-    for (const value of Object.values(obj)) {
-        collectSchemaRefs(value, refs)
-    }
-    return refs
-}
-
-function resolveNestedRefs(schemas, refs) {
-    // Iteratively resolve refs until no new ones are found
-    const allRefs = new Set(refs)
-    let changed = true
-    while (changed) {
-        changed = false
-        for (const ref of allRefs) {
-            const schemaName = ref.replace('#/components/schemas/', '')
-            const schema = schemas[schemaName]
-            if (schema) {
-                const nestedRefs = collectSchemaRefs(schema)
-                for (const nestedRef of nestedRefs) {
-                    if (!allRefs.has(nestedRef)) {
-                        allRefs.add(nestedRef)
-                        changed = true
-                    }
-                }
-            }
-        }
-    }
-    return allRefs
-}
-
 /**
  * Group endpoints by output directory.
- * Simple logic:
- * - tag matches product folder → goes there
- * - tag is explicitly "core" → goes to core
- * - no tag or unrecognized tag → skipped (tracked for reporting)
+ *
+ * Routing priority:
+ * 1. Tag matches product folder (includes auto-tags from backend) -> product
+ * 2. URL path contains product folder name (fallback) -> product
+ * 3. @validated_request decorator in posthog/api/ or ee/ -> core
+ * 4. Explicit "core" tag -> core
+ * 5. Otherwise -> skipped
  */
 function buildGroupedSchemasByOutput(schema, mappings) {
-    const grouped = new Map() // outputDir → { paths, _refs }
+    const grouped = new Map()
     const httpMethods = new Set(['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace'])
     const allSchemas = schema.components?.schemas ?? {}
-    const skippedTags = new Map() // tag → count (for unrecognized tags)
+    const skippedTags = new Map()
     let skippedNoTags = 0
+    let routedByTag = 0
+    let routedByUrl = 0
+    let routedByValidatedRequest = 0
 
     for (const [pathKey, operations] of Object.entries(schema.paths ?? {})) {
         for (const [method, operation] of Object.entries(operations ?? {})) {
@@ -156,20 +203,52 @@ function buildGroupedSchemasByOutput(schema, mappings) {
                 continue
             }
 
-            // Use x-explicit-tags (from @extend_schema decorator)
+            if (operation.deprecated) {
+                continue
+            }
+
+            const operationId = operation.operationId || ''
             const explicitTags = operation['x-explicit-tags']
             const tags = Array.isArray(explicitTags) && explicitTags.length ? explicitTags : []
 
-            // Find first tag that matches a product folder
-            const productTag = tags.find((t) => resolveTagToProduct(t, mappings) !== null)
+            let outputDir = null
+            let routingMethod = null
 
-            let outputDir
+            // Priority 1: Tag matches product folder (includes auto-tags from backend)
+            const productTag = tags.find((t) => resolveTagToProduct(t, mappings) !== null)
             if (productTag) {
                 outputDir = resolveProductToOutputDir(productTag, mappings.productFoldersOnDisk)
-            } else if (tags.includes('core')) {
-                outputDir = resolveProductToOutputDir('core', mappings.productFoldersOnDisk)
-            } else {
-                // Track skipped endpoints
+                routingMethod = 'tag'
+            }
+
+            // Priority 2: URL path contains product folder name (fallback)
+            if (!outputDir) {
+                const urlProduct = matchUrlToProduct(pathKey, mappings.productFoldersOnDisk)
+                if (urlProduct) {
+                    outputDir = resolveProductToOutputDir(urlProduct, mappings.productFoldersOnDisk)
+                    routingMethod = 'url'
+                }
+            }
+
+            // Priority 3: @validated_request decorator in core -> core
+            if (!outputDir) {
+                for (const snakeCase of mappings.validatedRequestViewSets) {
+                    if (operationId === snakeCase || operationId.startsWith(snakeCase + '_')) {
+                        outputDir = resolveProductToOutputDir(null, mappings.productFoldersOnDisk)
+                        routingMethod = 'validated_request'
+                        break
+                    }
+                }
+            }
+
+            // Priority 4: Explicit "core" tag
+            if (!outputDir && tags.includes('core')) {
+                outputDir = resolveProductToOutputDir(null, mappings.productFoldersOnDisk)
+                routingMethod = 'tag'
+            }
+
+            // No match - skip
+            if (!outputDir) {
                 if (tags.length === 0) {
                     skippedNoTags++
                 } else {
@@ -178,6 +257,14 @@ function buildGroupedSchemasByOutput(schema, mappings) {
                     }
                 }
                 continue
+            }
+
+            if (routingMethod === 'tag') {
+                routedByTag++
+            } else if (routingMethod === 'url') {
+                routedByUrl++
+            } else if (routingMethod === 'validated_request') {
+                routedByValidatedRequest++
             }
 
             if (!grouped.has(outputDir)) {
@@ -196,9 +283,16 @@ function buildGroupedSchemasByOutput(schema, mappings) {
         }
     }
 
+    // Report routing stats
+    console.log(`📊 Routing stats:`)
+    console.log(`   ${routedByTag} endpoints routed by tags (includes auto-tags from backend)`)
+    console.log(`   ${routedByUrl} endpoints routed by URL path`)
+    console.log(`   ${routedByValidatedRequest} endpoints routed by @validated_request decorator`)
+    console.log('')
+
     // Report skipped endpoints
     if (skippedNoTags > 0 || skippedTags.size > 0) {
-        console.log('⚠️  Skipped endpoints (no matching product folder):')
+        console.log('⚠️  Skipped endpoints (no product match or core tag):')
         if (skippedNoTags > 0) {
             console.log(`   ${skippedNoTags} endpoints with no @extend_schema tags`)
         }
@@ -233,7 +327,7 @@ function buildGroupedSchemasByOutput(schema, mappings) {
 
 // Main execution
 
-const schema = JSON.parse(fs.readFileSync(schemaPath, 'utf8'))
+const schema = preprocessSchema(JSON.parse(fs.readFileSync(schemaPath, 'utf8')))
 const mappings = loadProductMappings()
 const tmpDir = createTempDir()
 
@@ -298,91 +392,78 @@ const jobs = entries.map(([outputDir, groupedSchema]) => {
 
     console.log(`📦 ${label}: ${pathCount} endpoints, ${schemaCount} schemas`)
 
-    return { tempFile, outputDir, label }
+    const outputFile = path.join(outputDir, 'api.ts')
+    const mutatorPath = path.resolve(frontendRoot, 'src', 'lib', 'api-orval-mutator.ts')
+
+    fs.mkdirSync(outputDir, { recursive: true })
+
+    const config = {
+        input: tempFile,
+        output: {
+            target: outputFile,
+            mode: 'split',
+            client: 'fetch',
+            prettier: false,
+            override: {
+                header: (info) => [
+                    'Auto-generated from the Django backend OpenAPI schema.',
+                    'To modify these types, update the Django serializers or views, then run:',
+                    '  hogli build:openapi',
+                    'Questions or issues? #team-devex on Slack',
+                    '',
+                    ...(info?.title ? [info.title] : []),
+                    ...(info?.version ? ['OpenAPI spec version: ' + info.version] : []),
+                ],
+                namingConvention: {
+                    enum: 'PascalCase',
+                },
+                fetch: {
+                    includeHttpResponseReturnType: false,
+                },
+                mutator: {
+                    path: mutatorPath,
+                    name: 'apiMutator',
+                    external: ['lib/api'],
+                },
+                components: {
+                    schemas: { suffix: 'Api' },
+                },
+            },
+        },
+    }
+
+    return { tempFile, outputDir, label, config }
 })
 
 console.log('')
 console.log(`Running ${jobs.length} orval generations in parallel...`)
 console.log('')
 
-// Run all orval generations in parallel
-const results = await Promise.allSettled(
-    jobs.map(async ({ tempFile, outputDir, label }) => {
-        const { execSync } = await import('node:child_process')
-        const configFile = path.join(tmpDir, `orval-${label}.config.mjs`)
-        const outputFile = path.join(outputDir, 'api.ts')
-        const mutatorPath = path.resolve(frontendRoot, 'src', 'lib', 'api-orval-mutator.ts')
-        // Stub for orval's esbuild bundling - avoids scss import chain
-        const apiStubPath = path.resolve(frontendRoot, 'src', 'lib', 'api-stub-for-orval.ts')
-
-        fs.mkdirSync(outputDir, { recursive: true })
-
-        const config = `
-import { defineConfig } from 'orval';
-export default defineConfig({
-  api: {
-    input: '${tempFile}',
-    output: {
-      target: '${outputFile}',
-      mode: 'split',
-      client: 'fetch',
-      prettier: false,
-      override: {
-        header: (info) => [
-          'Auto-generated from the Django backend OpenAPI schema.',
-          'To modify these types, update the Django serializers or views, then run:',
-          '  hogli build:openapi',
-          'Questions or issues? #team-devex on Slack',
-          '',
-          ...(info?.title ? [info.title] : []),
-          ...(info?.version ? ['OpenAPI spec version: ' + info.version] : []),
-        ],
-        mutator: {
-          path: '${mutatorPath}',
-          name: 'apiMutator',
-          alias: {
-            'lib/api': '${apiStubPath}',
-          },
-        },
-        components: {
-          schemas: { suffix: 'Api' },
-        },
-      },
-    },
-  },
-});
-`
-        fs.writeFileSync(configFile, config)
-        execSync(`pnpm exec orval --config "${configFile}"`, { stdio: 'pipe', cwd: repoRoot })
-
-        return { label, outputDir }
-    })
-)
+// Run all orval generations in parallel (in-process, no subprocess overhead)
+const results = await runOrvalParallel(jobs.map((j) => ({ config: j.config, label: j.label })))
 
 // Report results and collect output dirs for formatting
 const outputDirs = []
-for (const result of results) {
+for (let i = 0; i < results.length; i++) {
+    const result = results[i]
+    const job = jobs[i]
     if (result.status === 'fulfilled') {
-        console.log(`   ✓ ${result.value.label} → ${path.relative(repoRoot, result.value.outputDir)}`)
-        outputDirs.push(result.value.outputDir)
+        console.log(`   ✓ ${job.label} → ${path.relative(repoRoot, job.outputDir)}`)
+        outputDirs.push(job.outputDir)
         generated++
     } else {
-        console.error(`   ✗ Failed: ${result.reason?.message || result.reason}`)
+        console.error(`   ✗ ${job.label}: ${result.reason?.message || result.reason}`)
         failed++
     }
 }
 
-// Run prettier once on all generated files
+// Run oxfmt once on all generated files
 if (outputDirs.length > 0) {
     console.log('')
     console.log('Formatting generated files...')
-    const globs = outputDirs.map((d) => `"${d}/**/*.ts"`).join(' ')
-    try {
-        execSync(`pnpm exec prettier --write ${globs}`, { stdio: 'pipe', cwd: repoRoot })
-        console.log('   ✓ Formatted')
-    } catch {
-        console.log('   ⚠️  Prettier formatting skipped (not critical)')
-    }
+    const globs = outputDirs.join(' ')
+    execSync(`pnpm exec oxfmt ${globs}`, { stdio: 'pipe', cwd: repoRoot })
+    console.log('   ✓ Formatted')
 }
 
 // Cleanup temp dir

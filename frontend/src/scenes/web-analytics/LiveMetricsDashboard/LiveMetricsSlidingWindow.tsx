@@ -1,8 +1,24 @@
-import { SlidingWindowBucket } from './LiveWebAnalyticsMetricsTypes'
+import {
+    BrowserBreakdownItem,
+    CountryBreakdownItem,
+    ReferrerItem,
+    SlidingWindowBucket,
+} from './LiveWebAnalyticsMetricsTypes'
 
 export class LiveMetricsSlidingWindow {
     private buckets = new Map<number, SlidingWindowBucket>()
     private windowSizeSeconds: number
+
+    // Tracks unique counts across all buckets
+    private userBucketCounts = new Map<string, number>()
+    private deviceBucketCounts = new Map<string, Map<string, number>>()
+    private browserBucketCounts = new Map<string, Map<string, number>>()
+    private countryBucketCounts = new Map<string, Map<string, number>>()
+
+    // Incrementally-maintained aggregates
+    private _totalPageviews = 0
+    private _globalPathCounts = new Map<string, number>()
+    private _globalReferrerCounts = new Map<string, number>()
 
     constructor(windowSizeMinutes: number) {
         this.windowSizeSeconds = windowSizeMinutes * 60
@@ -10,53 +26,245 @@ export class LiveMetricsSlidingWindow {
 
     addDataPoint(
         eventTs: number,
-        data: Partial<SlidingWindowBucket> & { distinctId?: string; distinctIds?: string[] }
+        distinctId: string,
+        data: {
+            pageviews?: number
+            pathname?: string
+            referringDomain?: string
+            device?: { deviceId: string; deviceType: string }
+            browser?: { deviceId: string; browserType: string }
+        }
     ): void {
-        const bucketTs = Math.floor(eventTs / 60) * 60
-        const bucket = this.buckets.get(bucketTs) ?? {
-            pageviews: 0,
-            devices: new Map(),
-            paths: new Map(),
-            uniqueUsers: new Set(),
+        const bucket = this.getOrCreateBucket(eventTs)
+
+        this.addUserToBucket(bucket, distinctId)
+
+        if (data.pageviews) {
+            bucket.pageviews += data.pageviews
+            this._totalPageviews += data.pageviews
+        }
+
+        if (data.pathname) {
+            bucket.paths.set(data.pathname, (bucket.paths.get(data.pathname) || 0) + 1)
+            this._globalPathCounts.set(data.pathname, (this._globalPathCounts.get(data.pathname) || 0) + 1)
+        }
+
+        if (data.referringDomain) {
+            bucket.referrers.set(data.referringDomain, (bucket.referrers.get(data.referringDomain) || 0) + 1)
+            this._globalReferrerCounts.set(
+                data.referringDomain,
+                (this._globalReferrerCounts.get(data.referringDomain) || 0) + 1
+            )
+        }
+
+        if (data.device) {
+            this.addDeviceToBucket(bucket, data.device.deviceType, data.device.deviceId)
+        }
+
+        if (data.browser) {
+            this.addBrowserToBucket(bucket, data.browser.browserType, data.browser.deviceId)
+        }
+    }
+
+    addGeoDataPoint(eventTs: number, countryCode: string, distinctId: string): void {
+        if (!countryCode || !distinctId) {
+            return
+        }
+        const bucket = this.getOrCreateBucket(eventTs)
+        this.addCountryToBucket(bucket, countryCode, distinctId)
+    }
+
+    extendBucketData(eventTs: number, data: SlidingWindowBucket): void {
+        const bucket = this.getOrCreateBucket(eventTs)
+
+        if (data.uniqueUsers) {
+            for (const distinctId of data.uniqueUsers) {
+                this.addUserToBucket(bucket, distinctId)
+            }
         }
 
         if (data.pageviews) {
             bucket.pageviews += data.pageviews
+            this._totalPageviews += data.pageviews
         }
 
         if (data.devices) {
-            for (const [device, count] of data.devices) {
-                bucket.devices.set(device, (bucket.devices.get(device) || 0) + count)
+            for (const [deviceType, deviceIds] of data.devices) {
+                for (const deviceId of deviceIds) {
+                    this.addDeviceToBucket(bucket, deviceType, deviceId)
+                }
+            }
+        }
+
+        if (data.browsers) {
+            for (const [browserType, deviceIds] of data.browsers) {
+                for (const deviceId of deviceIds) {
+                    this.addBrowserToBucket(bucket, browserType, deviceId)
+                }
             }
         }
 
         if (data.paths) {
             for (const [path, count] of data.paths) {
                 bucket.paths.set(path, (bucket.paths.get(path) || 0) + count)
-            }
-        }
-        if (data.uniqueUsers) {
-            for (const id of data.uniqueUsers) {
-                bucket.uniqueUsers.add(id)
-            }
-        }
-        if (data.distinctId) {
-            bucket.uniqueUsers.add(data.distinctId)
-        }
-        if (data.distinctIds) {
-            for (const id of data.distinctIds) {
-                bucket.uniqueUsers.add(id)
+                this._globalPathCounts.set(path, (this._globalPathCounts.get(path) || 0) + count)
             }
         }
 
-        this.buckets.set(bucketTs, bucket)
-        this.prune(eventTs)
+        if (data.referrers) {
+            for (const [referrer, count] of data.referrers) {
+                bucket.referrers.set(referrer, (bucket.referrers.get(referrer) || 0) + count)
+                this._globalReferrerCounts.set(referrer, (this._globalReferrerCounts.get(referrer) || 0) + count)
+            }
+        }
+
+        if (data.countries) {
+            for (const [countryCode, userIds] of data.countries) {
+                for (const userId of userIds) {
+                    this.addCountryToBucket(bucket, countryCode, userId)
+                }
+            }
+        }
     }
 
-    private prune(nowTs: number): void {
+    private addUserToBucket(bucket: SlidingWindowBucket, userId: string): void {
+        if (!bucket.uniqueUsers.has(userId)) {
+            bucket.uniqueUsers.add(userId)
+
+            const prevCount = this.userBucketCounts.get(userId) || 0
+            this.userBucketCounts.set(userId, prevCount + 1)
+
+            // Classify as new or returning based on whether we've seen this user globally
+            if (prevCount > 0) {
+                bucket.returningUserCount++
+            } else {
+                bucket.newUserCount++
+            }
+        }
+    }
+
+    private addItemToBucket(
+        bucketMap: Map<string, Set<string>>,
+        globalCounts: Map<string, Map<string, number>>,
+        itemType: string,
+        itemId: string
+    ): void {
+        const bucketIds = bucketMap.get(itemType) ?? new Set<string>()
+
+        if (!bucketIds.has(itemId)) {
+            bucketIds.add(itemId)
+            bucketMap.set(itemType, bucketIds)
+
+            const typeCounts = globalCounts.get(itemType) ?? new Map<string, number>()
+            typeCounts.set(itemId, (typeCounts.get(itemId) || 0) + 1)
+            globalCounts.set(itemType, typeCounts)
+        }
+    }
+
+    private addDeviceToBucket(bucket: SlidingWindowBucket, deviceType: string, deviceId: string): void {
+        this.addItemToBucket(bucket.devices, this.deviceBucketCounts, deviceType, deviceId)
+    }
+
+    private addBrowserToBucket(bucket: SlidingWindowBucket, browserType: string, deviceId: string): void {
+        this.addItemToBucket(bucket.browsers, this.browserBucketCounts, browserType, deviceId)
+    }
+
+    private addCountryToBucket(bucket: SlidingWindowBucket, countryCode: string, distinctId: string): void {
+        const bucketUserIds = bucket.countries.get(countryCode) ?? new Set<string>()
+
+        if (!bucketUserIds.has(distinctId)) {
+            bucketUserIds.add(distinctId)
+            bucket.countries.set(countryCode, bucketUserIds)
+
+            // Update global tracking
+            const countryCounts = this.countryBucketCounts.get(countryCode) ?? new Map<string, number>()
+            countryCounts.set(distinctId, (countryCounts.get(distinctId) || 0) + 1)
+            this.countryBucketCounts.set(countryCode, countryCounts)
+        }
+    }
+
+    private removeUsersFromTracking(bucket: SlidingWindowBucket): void {
+        for (const userId of bucket.uniqueUsers) {
+            const count = this.userBucketCounts.get(userId) || 0
+            if (count <= 1) {
+                this.userBucketCounts.delete(userId)
+            } else {
+                this.userBucketCounts.set(userId, count - 1)
+            }
+        }
+    }
+
+    private removeItemsFromTracking(
+        bucketMap: Map<string, Set<string>>,
+        globalCounts: Map<string, Map<string, number>>
+    ): void {
+        for (const [itemType, itemIds] of bucketMap) {
+            const typeCounts = globalCounts.get(itemType)
+            if (!typeCounts) {
+                continue
+            }
+
+            for (const itemId of itemIds) {
+                const count = typeCounts.get(itemId) || 0
+                if (count <= 1) {
+                    typeCounts.delete(itemId)
+                } else {
+                    typeCounts.set(itemId, count - 1)
+                }
+            }
+
+            if (typeCounts.size === 0) {
+                globalCounts.delete(itemType)
+            }
+        }
+    }
+
+    private removeCountriesFromTracking(bucket: SlidingWindowBucket): void {
+        for (const [countryCode, userIds] of bucket.countries) {
+            const countryCounts = this.countryBucketCounts.get(countryCode)
+            if (!countryCounts) {
+                continue
+            }
+
+            for (const userId of userIds) {
+                const count = countryCounts.get(userId) || 0
+                if (count <= 1) {
+                    countryCounts.delete(userId)
+                } else {
+                    countryCounts.set(userId, count - 1)
+                }
+            }
+
+            // Clean up empty country maps
+            if (countryCounts.size === 0) {
+                this.countryBucketCounts.delete(countryCode)
+            }
+        }
+    }
+
+    private decrementGlobalCounts(bucketMap: Map<string, number>, globalMap: Map<string, number>): void {
+        for (const [key, count] of bucketMap) {
+            const globalCount = globalMap.get(key) || 0
+            if (globalCount <= count) {
+                globalMap.delete(key)
+            } else {
+                globalMap.set(key, globalCount - count)
+            }
+        }
+    }
+
+    prune(): void {
+        const nowTs = Date.now() / 1000
         const threshold = nowTs - this.windowSizeSeconds
-        for (const ts of this.buckets.keys()) {
+        for (const [ts, bucket] of this.buckets.entries()) {
             if (ts < threshold) {
+                this.removeUsersFromTracking(bucket)
+                this.removeItemsFromTracking(bucket.devices, this.deviceBucketCounts)
+                this.removeItemsFromTracking(bucket.browsers, this.browserBucketCounts)
+                this.removeCountriesFromTracking(bucket)
+                this.decrementGlobalCounts(bucket.paths, this._globalPathCounts)
+                this.decrementGlobalCounts(bucket.referrers, this._globalReferrerCounts)
+                this._totalPageviews -= bucket.pageviews
                 this.buckets.delete(ts)
             }
         }
@@ -67,36 +275,139 @@ export class LiveMetricsSlidingWindow {
     }
 
     getTotalPageviews(): number {
+        return this._totalPageviews
+    }
+
+    getDeviceBreakdown(): { device: string; count: number; percentage: number }[] {
         let total = 0
-        for (const bucket of this.buckets.values()) {
-            total += bucket.pageviews
+        const counts: { device: string; count: number }[] = []
+
+        for (const [deviceType, deviceIdCounts] of this.deviceBucketCounts) {
+            const count = deviceIdCounts.size
+            total += count
+            counts.push({ device: deviceType, count })
+        }
+
+        if (total === 0) {
+            return []
+        }
+
+        return counts
+            .map(({ device, count }) => ({
+                device,
+                count,
+                percentage: (count / total) * 100,
+            }))
+            .sort((a, b) => b.count - a.count)
+    }
+
+    getBrowserBreakdown(limit?: number): BrowserBreakdownItem[] {
+        let total = 0
+        const counts: { browser: string; count: number }[] = []
+
+        for (const [browserType, deviceIdCounts] of this.browserBucketCounts) {
+            const count = deviceIdCounts.size
+            total += count
+            counts.push({ browser: browserType, count })
+        }
+
+        if (total === 0) {
+            return []
+        }
+
+        const sorted = counts
+            .map(({ browser, count }) => ({
+                browser,
+                count,
+                percentage: (count / total) * 100,
+            }))
+            .sort((a, b) => b.count - a.count)
+
+        if (!limit || sorted.length <= limit) {
+            return sorted
+        }
+
+        const top = sorted.slice(0, limit)
+        const othersCount = sorted.slice(limit).reduce((sum, item) => sum + item.count, 0)
+
+        if (othersCount > 0) {
+            top.push({
+                browser: 'Other',
+                count: othersCount,
+                percentage: (othersCount / total) * 100,
+            })
+        }
+
+        return top
+    }
+
+    getTotalBrowsers(): number {
+        let total = 0
+        for (const deviceIdCounts of this.browserBucketCounts.values()) {
+            total += deviceIdCounts.size
         }
         return total
     }
 
-    getDeviceTotals(): Map<string, number> {
-        const deviceTotals = new Map<string, number>()
-
-        for (const bucket of this.buckets.values()) {
-            for (const [device, count] of bucket.devices) {
-                const current = deviceTotals.get(device) ?? 0
-                deviceTotals.set(device, current + count)
-            }
-        }
-
-        return deviceTotals
+    getTopPaths(limit: number): { path: string; views: number }[] {
+        return this.getTopEntries(this._globalPathCounts, limit).map(([path, views]) => ({ path, views }))
     }
 
-    getTopPaths(limit: number): { path: string; views: number }[] {
-        const aggregates = new Map<string, number>()
-        for (const bucket of this.buckets.values()) {
-            for (const [path, count] of bucket.paths) {
-                aggregates.set(path, (aggregates.get(path) || 0) + count)
-            }
+    getTopReferrers(limit: number): ReferrerItem[] {
+        return this.getTopEntries(this._globalReferrerCounts, limit).map(([referrer, views]) => ({ referrer, views }))
+    }
+
+    private getTopEntries(map: Map<string, number>, limit: number): [string, number][] {
+        return [...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit)
+    }
+
+    getCountryBreakdown(): CountryBreakdownItem[] {
+        let total = 0
+        const counts: { country: string; count: number }[] = []
+
+        for (const [countryCode, userIdCounts] of this.countryBucketCounts) {
+            const count = userIdCounts.size
+            total += count
+            counts.push({ country: countryCode, count })
         }
-        return [...aggregates.entries()]
-            .map(([path, views]) => ({ path, views }))
-            .sort((a, b) => b.views - a.views)
-            .slice(0, limit)
+
+        if (total === 0) {
+            return []
+        }
+
+        return counts
+            .map(({ country, count }) => ({
+                country,
+                count,
+                percentage: (count / total) * 100,
+            }))
+            .sort((a, b) => b.count - a.count)
+    }
+
+    getTotalUniqueUsers(): number {
+        return this.userBucketCounts.size
+    }
+
+    private getOrCreateBucket(eventTs: number): SlidingWindowBucket {
+        const bucketTs = Math.floor(eventTs / 60) * 60
+
+        let bucket = this.buckets.get(bucketTs)
+
+        if (!bucket) {
+            bucket = {
+                pageviews: 0,
+                newUserCount: 0,
+                returningUserCount: 0,
+                devices: new Map<string, Set<string>>(),
+                browsers: new Map<string, Set<string>>(),
+                paths: new Map<string, number>(),
+                referrers: new Map<string, number>(),
+                uniqueUsers: new Set<string>(),
+                countries: new Map<string, Set<string>>(),
+            }
+            this.buckets.set(bucketTs, bucket)
+        }
+
+        return bucket
     }
 }

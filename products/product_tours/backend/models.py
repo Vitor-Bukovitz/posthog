@@ -35,14 +35,25 @@ class ProductTour(models.Model):
         related_query_name="product_tour_internal_targeting_flag",
     )
 
+    linked_flag = models.ForeignKey(
+        "posthog.FeatureFlag",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="product_tours_linked_flag",
+        related_query_name="product_tour_linked_flag",
+        db_index=False,
+    )
+
     linked_surveys = models.ManyToManyField(
-        "posthog.Survey",
+        "surveys.Survey",
         blank=True,
         related_name="product_tours",
         related_query_name="product_tour",
     )
 
     content = models.JSONField(default=dict, blank=True)
+    draft_content = models.JSONField(null=True, blank=True, default=None)
 
     auto_launch = models.BooleanField(default=False)
 
@@ -104,6 +115,6 @@ class ProductTour(models.Model):
             "url_match_type": conditions.get("urlMatchType"),
             "has_delay": bool(conditions.get("autoShowDelaySeconds")),
             "has_selector_condition": bool(conditions.get("selector")),
-            "has_action_triggers": bool(conditions.get("actions", {}).get("values")),
-            "has_event_triggers": bool(conditions.get("events", {}).get("values")),
+            "has_action_triggers": bool((conditions.get("actions") or {}).get("values")),
+            "has_event_triggers": bool((conditions.get("events") or {}).get("values")),
         }

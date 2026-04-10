@@ -1,6 +1,7 @@
 package events
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -97,6 +98,7 @@ type PostHogEventWrapper struct {
 	Ip         string         `json:"ip"`
 	Data       string         `json:"data"`
 	Token      string         `json:"token"`
+	Timestamp  string         `json:"timestamp"`
 }
 
 //easyjson:json
@@ -106,10 +108,11 @@ type PostHogEvent struct {
 	Properties map[string]interface{} `json:"properties"`
 	Timestamp  interface{}            `json:"timestamp,omitempty"`
 
-	Uuid       string
-	DistinctId string
-	Lat        float64
-	Lng        float64
+	Uuid        string
+	DistinctId  string
+	Lat         float64
+	Lng         float64
+	CountryCode string
 }
 
 type KafkaConsumerInterface interface {
@@ -126,24 +129,25 @@ type PostHogKafkaConsumer struct {
 	outgoingChan chan PostHogEvent
 	statsChan    chan CountEvent
 	parallel     int
+	Broker       *RedisEventBroker
 }
 
 func NewPostHogKafkaConsumer(
-	kafkaConfig configs.KafkaConfig, geolocator geo.GeoLocator,
+	consumerConfig configs.ConsumerConfig,
+	geolocator geo.GeoLocator,
 	outgoingChan chan PostHogEvent, statsChan chan CountEvent, parallel int) (*PostHogKafkaConsumer, error) {
 
 	config := &kafka.ConfigMap{
-		"bootstrap.servers":          kafkaConfig.Brokers,
-		"group.id":                   kafkaConfig.GroupID,
+		"bootstrap.servers":          consumerConfig.Brokers,
+		"group.id":                   consumerConfig.GroupID,
 		"auto.offset.reset":          "latest",
 		"enable.auto.commit":         false,
-		"security.protocol":          kafkaConfig.SecurityProtocol,
+		"security.protocol":          consumerConfig.SecurityProtocol,
 		"fetch.message.max.bytes":    1_000_000_000,
 		"fetch.max.bytes":            1_000_000_000,
 		"queued.max.messages.kbytes": 2_000_000,
 	}
-
-	applyKafkaConfigOverrides(config, kafkaConfig)
+	applyKafkaConfigOverrides(config, consumerConfig)
 
 	consumer, err := kafka.NewConsumer(config)
 	if err != nil {
@@ -152,7 +156,7 @@ func NewPostHogKafkaConsumer(
 
 	return &PostHogKafkaConsumer{
 		consumer:     consumer,
-		topic:        kafkaConfig.Topic,
+		topic:        consumerConfig.Topic,
 		geolocator:   geolocator,
 		incoming:     make(chan []byte, (1+parallel)*100),
 		outgoingChan: outgoingChan,
@@ -161,7 +165,7 @@ func NewPostHogKafkaConsumer(
 	}, nil
 }
 
-func (c *PostHogKafkaConsumer) Consume() {
+func (c *PostHogKafkaConsumer) Consume(ctx context.Context) {
 	rebalanceCallback := func(consumer *kafka.Consumer, event kafka.Event) error {
 		if _, ok := event.(kafka.AssignedPartitions); ok {
 			log.Printf("✅ Livestream service ready")
@@ -174,7 +178,7 @@ func (c *PostHogKafkaConsumer) Consume() {
 	}
 
 	for i := 0; i < c.parallel; i++ {
-		go c.runParsing()
+		go c.runParsing(ctx)
 	}
 
 	for {
@@ -199,15 +203,22 @@ func (c *PostHogKafkaConsumer) Consume() {
 	}
 }
 
-func (c *PostHogKafkaConsumer) runParsing() {
+func (c *PostHogKafkaConsumer) runParsing(ctx context.Context) {
 	for {
 		value, ok := <-c.incoming
 		if !ok {
 			return
 		}
 		phEvent := parse(c.geolocator, value)
-		c.outgoingChan <- phEvent
+		if phEvent.Token == "" {
+			continue
+		}
 		c.statsChan <- CountEvent{Token: phEvent.Token, DistinctID: phEvent.DistinctId}
+		if c.Broker != nil {
+			c.Broker.Publish(ctx, phEvent)
+		} else {
+			c.outgoingChan <- phEvent
+		}
 	}
 }
 
@@ -217,8 +228,16 @@ func parse(geolocator geo.GeoLocator, kafkaMessage []byte) PostHogEvent {
 		log.Printf("Error decoding JSON %s: %v", err, string(kafkaMessage))
 	}
 
+	if wrapperMessage.Timestamp != "" {
+		if eventTime, err := time.Parse(time.RFC3339Nano, wrapperMessage.Timestamp); err == nil {
+			if lag := time.Since(eventTime).Seconds(); lag >= 0 {
+				metrics.EventLagHistogram.Observe(lag)
+			}
+		}
+	}
+
 	phEvent := PostHogEvent{
-		Timestamp:  time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+		Timestamp:  wrapperMessage.Timestamp,
 		Token:      "",
 		Event:      "",
 		Properties: make(map[string]interface{}),
@@ -252,12 +271,13 @@ func parse(geolocator geo.GeoLocator, kafkaMessage []byte) PostHogEvent {
 	}
 
 	if ipStr != "" {
-		var err error
-		phEvent.Lat, phEvent.Lng, err = geolocator.Lookup(ipStr)
-		if err != nil && err.Error() != "invalid IP address" { // An invalid IP address is not an error on our side
-			// TODO capture error to PostHog
-			_ = err
+		geoResult, err := geolocator.Lookup(ipStr)
+		if err != nil {
+			metrics.GeoIPLookupFailures.Inc()
 		}
+		phEvent.Lat = geoResult.Latitude
+		phEvent.Lng = geoResult.Longitude
+		phEvent.CountryCode = geoResult.CountryCode
 	}
 
 	return phEvent
@@ -275,14 +295,17 @@ func (c *PostHogKafkaConsumer) IncomingRatio() float64 {
 	return float64(len(c.incoming)) / float64(cap(c.incoming))
 }
 
-func applyKafkaConfigOverrides(config *kafka.ConfigMap, kafkaConfig configs.KafkaConfig) {
-	if kafkaConfig.SessionTimeoutMs > 0 {
-		_ = config.SetKey("session.timeout.ms", kafkaConfig.SessionTimeoutMs)
+func applyKafkaConfigOverrides(config *kafka.ConfigMap, consumerConfig configs.ConsumerConfig) {
+	if consumerConfig.ClientID != "" {
+		_ = config.SetKey("client.id", consumerConfig.ClientID)
 	}
-	if kafkaConfig.HeartbeatIntervalMs > 0 {
-		_ = config.SetKey("heartbeat.interval.ms", kafkaConfig.HeartbeatIntervalMs)
+	if consumerConfig.SessionTimeoutMs > 0 {
+		_ = config.SetKey("session.timeout.ms", consumerConfig.SessionTimeoutMs)
 	}
-	if kafkaConfig.MaxPollIntervalMs > 0 {
-		_ = config.SetKey("max.poll.interval.ms", kafkaConfig.MaxPollIntervalMs)
+	if consumerConfig.HeartbeatIntervalMs > 0 {
+		_ = config.SetKey("heartbeat.interval.ms", consumerConfig.HeartbeatIntervalMs)
+	}
+	if consumerConfig.MaxPollIntervalMs > 0 {
+		_ = config.SetKey("max.poll.interval.ms", consumerConfig.MaxPollIntervalMs)
 	}
 }

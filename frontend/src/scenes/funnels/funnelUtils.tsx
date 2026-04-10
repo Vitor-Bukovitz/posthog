@@ -12,7 +12,7 @@ import { elementsToAction } from 'scenes/activity/explore/createActionFromEvent'
 import { teamLogic } from 'scenes/teamLogic'
 
 import { Noun } from '~/models/groupsModel'
-import { AnyEntityNode, FunnelExclusionSteps, FunnelsFilter } from '~/queries/schema/schema-general'
+import { AnyEntityNode, BreakdownFilter, FunnelExclusionSteps, FunnelsFilter } from '~/queries/schema/schema-general'
 import { integer } from '~/queries/schema/type-utils'
 import {
     AnyPropertyFilter,
@@ -22,6 +22,7 @@ import {
     ElementPropertyFilter,
     FlattenedFunnelStepByBreakdown,
     FunnelConversionWindow,
+    FunnelConversionWindowTimeUnit,
     FunnelCorrelation,
     FunnelCorrelationResultsType,
     FunnelResultType,
@@ -32,6 +33,15 @@ import {
     PropertyFilterType,
     PropertyOperator,
 } from '~/types'
+
+export const TIME_INTERVAL_BOUNDS: Record<FunnelConversionWindowTimeUnit, number[]> = {
+    [FunnelConversionWindowTimeUnit.Second]: [1, 3600],
+    [FunnelConversionWindowTimeUnit.Minute]: [1, 1440],
+    [FunnelConversionWindowTimeUnit.Hour]: [1, 24],
+    [FunnelConversionWindowTimeUnit.Day]: [1, 365],
+    [FunnelConversionWindowTimeUnit.Week]: [1, 53],
+    [FunnelConversionWindowTimeUnit.Month]: [1, 12],
+}
 
 /** Chosen via heuristics by eyeballing some values
  * Assuming a normal distribution, then 90% of values are within 1.5 standard deviations of the mean
@@ -203,8 +213,8 @@ export const getBreakdownStepValues = (
     }
     if (
         isBaseline ||
-        breakdownStep?.breakdown_value === 'Baseline' ||
-        breakdownStep?.breakdown_value?.[0] === 'Baseline'
+        breakdownStep.breakdown_value === 'Baseline' ||
+        (Array.isArray(breakdownStep.breakdown_value) && breakdownStep.breakdown_value[0] === 'Baseline')
     ) {
         return {
             rowKey: 'baseline_0',
@@ -264,7 +274,7 @@ export function getIncompleteConversionWindowStartDate(
     window: FunnelConversionWindow,
     startDate: dayjs.Dayjs = dayjs()
 ): dayjs.Dayjs {
-    const { funnelWindowInterval, funnelWindowIntervalUnit } = window
+    const { funnelWindowInterval = 14, funnelWindowIntervalUnit } = window
     return startDate.subtract(funnelWindowInterval, funnelWindowIntervalUnit)
 }
 
@@ -643,4 +653,27 @@ export function getTooltipTitleForDroppedOff(
             {funnelsFilter?.funnelStepReference === FunnelStepReference.previous ? 'previous' : 'first'} step
         </>
     )
+}
+
+// Returns the single visible breakdown series on a funnel step, when the step is rendered
+// with the non-breakdown layout but a breakdown filter is set. Lets callers route clicks
+// through `openPersonsModalForSeries` so the persons modal is scoped to that value.
+export function getStepBreakdownSeries(
+    step: Pick<FunnelStepWithConversionMetrics, 'nested_breakdown'>,
+    breakdownFilter: BreakdownFilter | null | undefined
+): FunnelStepWithConversionMetrics | null {
+    if (!breakdownFilter?.breakdown) {
+        return null
+    }
+
+    if (!Array.isArray(step.nested_breakdown) || step.nested_breakdown.length !== 1) {
+        return null
+    }
+
+    const single = step.nested_breakdown[0]
+    if (!single || single.breakdown_value == null) {
+        return null
+    }
+
+    return single
 }

@@ -14,23 +14,20 @@
  */
 export type EvaluationRuntimeEnumApi = (typeof EvaluationRuntimeEnumApi)[keyof typeof EvaluationRuntimeEnumApi]
 
-// eslint-disable-next-line @typescript-eslint/no-redeclare
 export const EvaluationRuntimeEnumApi = {
-    server: 'server',
-    client: 'client',
-    all: 'all',
+    Server: 'server',
+    Client: 'client',
+    All: 'all',
 } as const
 
 export type BlankEnumApi = (typeof BlankEnumApi)[keyof typeof BlankEnumApi]
 
-// eslint-disable-next-line @typescript-eslint/no-redeclare
 export const BlankEnumApi = {
     '': '',
 } as const
 
 export type NullEnumApi = (typeof NullEnumApi)[keyof typeof NullEnumApi]
 
-// eslint-disable-next-line @typescript-eslint/no-redeclare
 export const NullEnumApi = {} as const
 
 /**
@@ -39,10 +36,9 @@ export const NullEnumApi = {} as const
  */
 export type BucketingIdentifierEnumApi = (typeof BucketingIdentifierEnumApi)[keyof typeof BucketingIdentifierEnumApi]
 
-// eslint-disable-next-line @typescript-eslint/no-redeclare
 export const BucketingIdentifierEnumApi = {
-    distinct_id: 'distinct_id',
-    device_id: 'device_id',
+    DistinctId: 'distinct_id',
+    DeviceId: 'device_id',
 } as const
 
 export type MinimalFeatureFlagApiFilters = { [key: string]: unknown }
@@ -71,13 +67,13 @@ export interface MinimalFeatureFlagApi {
 * `server` - Server
 * `client` - Client
 * `all` - All */
-    evaluation_runtime?: EvaluationRuntimeEnumApi | BlankEnumApi | NullEnumApi
+    evaluation_runtime?: EvaluationRuntimeEnumApi | BlankEnumApi | NullEnumApi | null
     /** Identifier used for bucketing users into rollout and variants
 
 * `distinct_id` - User ID (default)
 * `device_id` - Device ID */
-    bucketing_identifier?: BucketingIdentifierEnumApi | BlankEnumApi | NullEnumApi
-    readonly evaluation_tags: readonly string[]
+    bucketing_identifier?: BucketingIdentifierEnumApi | BlankEnumApi | NullEnumApi | null
+    readonly evaluation_contexts: readonly string[]
 }
 
 /**
@@ -90,26 +86,46 @@ export interface MinimalFeatureFlagApi {
  */
 export type StageEnumApi = (typeof StageEnumApi)[keyof typeof StageEnumApi]
 
-// eslint-disable-next-line @typescript-eslint/no-redeclare
 export const StageEnumApi = {
-    draft: 'draft',
-    concept: 'concept',
-    alpha: 'alpha',
-    beta: 'beta',
-    'general-availability': 'general-availability',
-    archived: 'archived',
+    Draft: 'draft',
+    Concept: 'concept',
+    Alpha: 'alpha',
+    Beta: 'beta',
+    GeneralAvailability: 'general-availability',
+    Archived: 'archived',
 } as const
+
+/**
+ * Feature flag payload for this early access feature
+ */
+export type EarlyAccessFeatureApiPayload = { [key: string]: unknown }
 
 export interface EarlyAccessFeatureApi {
     readonly id: string
     readonly feature_flag: MinimalFeatureFlagApi
-    /** @maxLength 200 */
+    /**
+     * The name of the early access feature.
+     * @maxLength 200
+     */
     name: string
+    /** A longer description of what this early access feature does, shown to users in the opt-in UI. */
     description?: string
+    /** Lifecycle stage. Valid values: draft, concept, alpha, beta, general-availability, archived. Moving to an active stage (alpha/beta/general-availability) enables the feature flag for opted-in users.
+
+* `draft` - draft
+* `concept` - concept
+* `alpha` - alpha
+* `beta` - beta
+* `general-availability` - general availability
+* `archived` - archived */
     stage: StageEnumApi
-    /** @maxLength 800 */
+    /**
+     * URL to external documentation for this feature. Shown to users in the opt-in UI.
+     * @maxLength 800
+     */
     documentation_url?: string
-    readonly payload: string
+    /** Feature flag payload for this early access feature */
+    readonly payload: EarlyAccessFeatureApiPayload
     readonly created_at: string
 }
 
@@ -124,29 +140,67 @@ export interface PaginatedEarlyAccessFeatureListApi {
 
 export interface EarlyAccessFeatureSerializerCreateOnlyApi {
     readonly id: string
-    /** @maxLength 200 */
+    /**
+     * The name of the early access feature.
+     * @maxLength 200
+     */
     name: string
+    /** A longer description of what this early access feature does, shown to users in the opt-in UI. */
     description?: string
+    /** Lifecycle stage. Valid values: draft, concept, alpha, beta, general-availability, archived. Moving to an active stage (alpha/beta/general-availability) enables the feature flag for opted-in users.
+
+* `draft` - draft
+* `concept` - concept
+* `alpha` - alpha
+* `beta` - beta
+* `general-availability` - general availability
+* `archived` - archived */
     stage: StageEnumApi
-    /** @maxLength 800 */
+    /**
+     * URL to external documentation for this feature. Shown to users in the opt-in UI.
+     * @maxLength 800
+     */
     documentation_url?: string
+    /** Arbitrary JSON metadata associated with this feature. */
     payload?: unknown
     readonly created_at: string
+    /** Optional ID of an existing feature flag to link. If omitted, a new flag is auto-created from the feature name. The flag must not already be linked to another feature, must not be group-based, and must not be multivariate. */
     feature_flag_id?: number
     readonly feature_flag: MinimalFeatureFlagApi
     _create_in_folder?: string
 }
 
+/**
+ * Feature flag payload for this early access feature
+ */
+export type PatchedEarlyAccessFeatureApiPayload = { [key: string]: unknown }
+
 export interface PatchedEarlyAccessFeatureApi {
     readonly id?: string
     readonly feature_flag?: MinimalFeatureFlagApi
-    /** @maxLength 200 */
+    /**
+     * The name of the early access feature.
+     * @maxLength 200
+     */
     name?: string
+    /** A longer description of what this early access feature does, shown to users in the opt-in UI. */
     description?: string
+    /** Lifecycle stage. Valid values: draft, concept, alpha, beta, general-availability, archived. Moving to an active stage (alpha/beta/general-availability) enables the feature flag for opted-in users.
+
+* `draft` - draft
+* `concept` - concept
+* `alpha` - alpha
+* `beta` - beta
+* `general-availability` - general availability
+* `archived` - archived */
     stage?: StageEnumApi
-    /** @maxLength 800 */
+    /**
+     * URL to external documentation for this feature. Shown to users in the opt-in UI.
+     * @maxLength 800
+     */
     documentation_url?: string
-    readonly payload?: string
+    /** Feature flag payload for this early access feature */
+    readonly payload?: PatchedEarlyAccessFeatureApiPayload
     readonly created_at?: string
 }
 

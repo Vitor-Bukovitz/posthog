@@ -27,6 +27,7 @@ from posthog.schema import (
     FailureMessage,
     HumanMessage,
     MaxBillingContext,
+    MultiQuestionForm,
     SubagentUpdateEvent,
 )
 
@@ -40,17 +41,20 @@ from posthog.utils import get_instance_region
 
 from ee.hogai.core.base import BaseAssistantGraph
 from ee.hogai.core.stream_processor import AssistantStreamProcessorProtocol
-from ee.hogai.tool import PENDING_APPROVAL_STATUS
+from ee.hogai.tool import ApprovalRequest
 from ee.hogai.utils.exceptions import (
+    HTTPX_TRANSPORT_EXCEPTIONS,
     LLM_API_EXCEPTIONS,
     LLM_CLIENT_ERROR_COUNTER,
     LLM_CLIENT_EXCEPTIONS,
     LLM_PROVIDER_ERROR_COUNTER,
     LLM_TRANSIENT_EXCEPTIONS,
+    LLM_TRANSPORT_ERROR_COUNTER,
     GenerationCanceled,
+    resolve_llm_provider,
 )
 from ee.hogai.utils.feature_flags import is_privacy_mode_enabled
-from ee.hogai.utils.helpers import extract_stream_update, find_last_message_of_type
+from ee.hogai.utils.helpers import extract_stream_update
 from ee.hogai.utils.state import validate_state_update
 from ee.hogai.utils.types.base import (
     ApprovalPayload,
@@ -58,6 +62,7 @@ from ee.hogai.utils.types.base import (
     AssistantOutput,
     AssistantResultUnion,
     AssistantStreamedMessageUnion,
+    ConversationTitleAction,
     LangGraphUpdateEvent,
 )
 from ee.hogai.utils.types.composed import AssistantMaxGraphState, AssistantMaxPartialGraphState
@@ -134,6 +139,7 @@ class BaseAgentRunner(ABC):
         stream_processor: AssistantStreamProcessorProtocol,
         slack_thread_context: Optional["SlackThreadContext"] = None,
         is_agent_billable: bool = True,
+        is_impersonated: bool = False,
         resume_payload: Optional[dict[str, Any]] = None,
     ):
         self._team = team
@@ -143,6 +149,7 @@ class BaseAgentRunner(ABC):
         self._conversation = conversation
         self._latest_message = new_message.model_copy(deep=True, update={"id": str(uuid4())}) if new_message else None
         self._is_new_conversation = is_new_conversation
+        self._pending_conversation_update = False
         self._state = None
         self._state_type = state_type
         self._partial_state_type = partial_state_type
@@ -164,8 +171,9 @@ class BaseAgentRunner(ABC):
                     "$session_id": self._session_id,
                     "is_subagent": not self._use_checkpointer,
                     "$groups": event_usage.groups(team=team),
-                    "ai_support_impersonated": not is_agent_billable,
-                    "ai_product": "posthog_ai",
+                    "ai_support_impersonated": is_impersonated,
+                    "ai_product": "mcp" if self._conversation.type == Conversation.Type.TOOL_CALL else "posthog_ai",
+                    "conversation_type": self._conversation.type,
                 }
                 # Use SubagentCallbackHandler when parent_span_id is provided to nest all events under the parent
                 if parent_span_id:
@@ -258,6 +266,7 @@ class BaseAgentRunner(ABC):
                 # Send the latest received human message with the initialized id.
                 yield AssistantEventType.MESSAGE, self._latest_message
 
+            self._pending_conversation_update = False
             try:
                 async for update in generator:
                     if messages := await self._process_update(update):
@@ -273,6 +282,13 @@ class BaseAgentRunner(ABC):
                                 yield AssistantEventType.STATUS, message
                             elif isinstance(message, AssistantUpdateEvent | SubagentUpdateEvent):
                                 yield AssistantEventType.UPDATE, message
+
+                    # Re-yield the conversation when the title generator has
+                    # produced a title. Checked after _process_update so the
+                    # flag set by ConversationTitleAction is picked up.
+                    if self._pending_conversation_update:
+                        self._pending_conversation_update = False
+                        yield AssistantEventType.CONVERSATION, self._conversation
             except GraphInterrupt:
                 # GraphInterrupt is raised when interrupt() is called in a tool.
                 # TRICKY: don't reset state. The interrupt handling code
@@ -295,7 +311,7 @@ class BaseAgentRunner(ABC):
                 # Client/validation errors (400, 422) - these won't resolve on retry
                 if self._use_checkpointer:
                     await self._graph.aupdate_state(config, self._partial_state_type.get_reset_state())
-                provider = type(e).__module__.partition(".")[0] or "unknown_provider"
+                provider = resolve_llm_provider(e)
                 LLM_CLIENT_ERROR_COUNTER.labels(provider=provider).inc()
                 logger.exception("llm_client_error", error=str(e), provider=provider)
                 posthoganalytics.capture_exception(
@@ -315,11 +331,35 @@ class BaseAgentRunner(ABC):
                     ),
                 )
                 return  # Don't run interrupt handling after client errors
+            except HTTPX_TRANSPORT_EXCEPTIONS as e:
+                # Network-level transport errors (not LLM provider errors).
+                # Tracked on a separate counter to avoid false provider alerts.
+                if self._use_checkpointer:
+                    await self._graph.aupdate_state(config, self._partial_state_type.get_reset_state())
+                error_type = type(e).__name__
+                LLM_TRANSPORT_ERROR_COUNTER.labels(error_type=error_type).inc()
+                logger.exception("llm_transport_error", error=str(e), error_type=error_type)
+                posthoganalytics.capture_exception(
+                    e,
+                    distinct_id=self._user.distinct_id if self._user else None,
+                    properties={
+                        "error_type": "llm_transport_error",
+                        "tag": "max_ai",
+                    },
+                )
+                yield (
+                    AssistantEventType.MESSAGE,
+                    FailureMessage(
+                        content="I'm unable to respond right now due to a temporary service issue. Please try again later.",
+                        id=str(uuid4()),
+                    ),
+                )
+                return  # Don't run interrupt handling after transport errors
             except LLM_TRANSIENT_EXCEPTIONS as e:
                 # Transient errors (5xx, rate limits, timeouts) - may resolve on retry
                 if self._use_checkpointer:
                     await self._graph.aupdate_state(config, self._partial_state_type.get_reset_state())
-                provider = type(e).__module__.partition(".")[0] or "unknown_provider"
+                provider = resolve_llm_provider(e)
                 LLM_PROVIDER_ERROR_COUNTER.labels(provider=provider).inc()
                 logger.exception("llm_provider_error", error=str(e), provider=provider)
                 posthoganalytics.capture_exception(
@@ -343,7 +383,7 @@ class BaseAgentRunner(ABC):
                 # Catch-all for other API errors (auth errors, etc.)
                 if self._use_checkpointer:
                     await self._graph.aupdate_state(config, self._partial_state_type.get_reset_state())
-                provider = type(e).__module__.partition(".")[0] or "unknown_provider"
+                provider = resolve_llm_provider(e)
                 LLM_PROVIDER_ERROR_COUNTER.labels(provider=provider).inc()
                 logger.exception("llm_api_error", error=str(e), provider=provider)
                 posthoganalytics.capture_exception(
@@ -401,7 +441,7 @@ class BaseAgentRunner(ABC):
 
             if state.next:
                 interrupt_messages: list[Any] = []
-                has_approval_interrupt = False
+                should_not_update_state = False
                 for task in state.tasks:
                     for interrupt in task.interrupts:
                         if interrupt.value is None:
@@ -412,35 +452,34 @@ class BaseAgentRunner(ABC):
                             interrupt_message = AssistantMessage(content=interrupt.value, id=str(uuid4()))
                             interrupt_messages.append(interrupt_message)
                             yield AssistantEventType.MESSAGE, interrupt_message
-                        elif isinstance(interrupt.value, dict):
+                        elif isinstance(interrupt.value, MultiQuestionForm):
+                            # No need to yield a message here - the form will be displayed to the user through the tool call args
+                            # and the answers comes through the tool call result ui_payload
+                            should_not_update_state = True
+                        elif isinstance(interrupt.value, ApprovalRequest):
                             # Check if this is an ApprovalRequest from interrupt() in a tool
-                            if interrupt.value.get("status") == PENDING_APPROVAL_STATUS:
-                                has_approval_interrupt = True
-                                # Stream approval event directly
-                                message_id = str(uuid4())
-                                approval_payload = ApprovalPayload(
-                                    proposal_id=interrupt.value["proposal_id"],
-                                    decision_status="pending",
-                                    tool_name=interrupt.value["tool_name"],
-                                    preview=interrupt.value["preview"],
-                                    payload=interrupt.value["payload"],
-                                    original_tool_call_id=interrupt.value.get("original_tool_call_id"),
-                                    message_id=message_id,
-                                )
-                                yield AssistantEventType.APPROVAL, approval_payload
-                                # Store approval card metadata for persistence (page reload)
-                                await self._store_approval_card_data(approval_payload)
-                            else:
-                                interrupt_message = interrupt.value
-                                interrupt_messages.append(interrupt_message)
-                                yield AssistantEventType.MESSAGE, interrupt_message
+                            should_not_update_state = True
+                            # Stream approval event directly
+                            message_id = str(uuid4())
+                            approval_payload = ApprovalPayload(
+                                proposal_id=interrupt.value.proposal_id,
+                                decision_status="pending",
+                                tool_name=interrupt.value.tool_name,
+                                preview=interrupt.value.preview,
+                                payload=interrupt.value.payload,
+                                original_tool_call_id=interrupt.value.original_tool_call_id,
+                                message_id=message_id,
+                            )
+                            yield AssistantEventType.APPROVAL, approval_payload
+                            # Store approval card metadata for persistence (page reload)
+                            await self._store_approval_card_data(approval_payload)
                         else:
                             interrupt_message = interrupt.value
                             interrupt_messages.append(interrupt_message)
                             yield AssistantEventType.MESSAGE, interrupt_message
 
                 # TRICKY: For approval interrupts, we intentionally do NOT call aupdate_state().
-                if has_approval_interrupt:
+                if should_not_update_state:
                     return
 
                 # For other interrupts (NodeInterrupt), update state
@@ -482,10 +521,6 @@ class BaseAgentRunner(ABC):
             snapshot = await self._graph.aget_state(config)
             saved_state = validate_state_update(snapshot.values, self._state_type)
             last_recorded_dt = saved_state.start_dt
-
-            # When resuming after a create_form interrupt, create the tool call response message
-            if form_response_message := self._get_form_response_message(saved_state):
-                self._latest_message = form_response_message
 
             # Add existing ids to streamed messages, so we don't send the messages again.
             for message in saved_state.messages:
@@ -553,6 +588,11 @@ class BaseAgentRunner(ABC):
     async def _process_update(self, update: Any) -> list[AssistantResultUnion] | None:
         update = extract_stream_update(update)
 
+        if isinstance(update, ConversationTitleAction):
+            self._conversation.title = update.title
+            self._pending_conversation_update = True
+            return None
+
         if not isinstance(update, AssistantDispatcherEvent):
             if updates := await self._stream_processor.process_langgraph_update(LangGraphUpdateEvent(update=update)):
                 return updates
@@ -587,6 +627,7 @@ class BaseAgentRunner(ABC):
             self._user,
             event_name,
             properties,
+            send_feature_flags=True,
         )
 
     @asynccontextmanager
@@ -668,41 +709,3 @@ class BaseAgentRunner(ABC):
 
         self._conversation.approval_decisions[proposal_id]["decision_status"] = status
         await self._conversation.asave(update_fields=["approval_decisions"])
-
-    def _get_form_response_message(self, saved_state: AssistantMaxGraphState) -> AssistantToolCallMessage | None:
-        """
-        When resuming after a create_form tool call (which raises NodeInterrupt(None)),
-        create an AssistantToolCallMessage with the user's response content and parsed answers in ui_payload.
-        """
-        if not saved_state.messages or not self._latest_message:
-            return None
-
-        # Form responses must come from a HumanMessage
-        if not isinstance(self._latest_message, HumanMessage):
-            return None
-
-        # Check if we have form answers in the ui_context
-        if not self._latest_message.ui_context or not self._latest_message.ui_context.form_answers:
-            return None
-
-        # Find the last assistant message with tool calls
-        last_assistant_message = find_last_message_of_type(saved_state.messages, AssistantMessage)
-        if not last_assistant_message or not last_assistant_message.tool_calls:
-            return None
-
-        # Find the create_form tool call
-        create_form_tool_call = next(
-            (tc for tc in last_assistant_message.tool_calls if tc.name == "create_form"),
-            None,
-        )
-        if not create_form_tool_call:
-            return None
-
-        answers = self._latest_message.ui_context.form_answers
-
-        return AssistantToolCallMessage(
-            content=self._latest_message.content or "",
-            id=str(uuid4()),
-            tool_call_id=create_form_tool_call.id,
-            ui_payload={"create_form": {"answers": answers}},
-        )

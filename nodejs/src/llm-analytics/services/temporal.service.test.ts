@@ -105,9 +105,10 @@ describe('TemporalService', () => {
             await service.startEvaluationRunWorkflow('eval-123', mockEvent)
 
             expect(mockClient.workflow.start).toHaveBeenCalledWith('run-evaluation', {
-                taskQueue: 'general-purpose-task-queue',
-                workflowId: 'eval-123-event-456-ingestion',
+                taskQueue: 'llm-analytics-evals-task-queue',
+                workflowId: 'llma-llm-eval-eval-123-event-456-ingestion',
                 workflowIdConflictPolicy: 'USE_EXISTING',
+                workflowTaskTimeout: '2 minutes',
                 args: [
                     {
                         evaluation_id: 'eval-123',
@@ -128,7 +129,7 @@ describe('TemporalService', () => {
             const workflowId2 = calls[1][1].workflowId
 
             expect(workflowId1).toEqual(workflowId2)
-            expect(workflowId1).toBe('eval-123-event-456-ingestion')
+            expect(workflowId1).toBe('llma-llm-eval-eval-123-event-456-ingestion')
         })
 
         it('generates different workflow IDs for different events', async () => {
@@ -143,8 +144,8 @@ describe('TemporalService', () => {
             const workflowId2 = calls[1][1].workflowId
 
             expect(workflowId1).not.toEqual(workflowId2)
-            expect(workflowId1).toBe('eval-123-event-1-ingestion')
-            expect(workflowId2).toBe('eval-123-event-2-ingestion')
+            expect(workflowId1).toBe('llma-llm-eval-eval-123-event-1-ingestion')
+            expect(workflowId2).toBe('llma-llm-eval-eval-123-event-2-ingestion')
         })
 
         it('returns workflow handle on success', async () => {

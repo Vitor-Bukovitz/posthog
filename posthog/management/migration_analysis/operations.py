@@ -9,7 +9,9 @@ from posthog.management.migration_analysis.models import OperationRisk
 from posthog.management.migration_analysis.utils import VolatileFunctionDetector, check_drop_properly_staged
 
 # Base URL for migration safety documentation
-SAFE_MIGRATIONS_DOCS_URL = "https://github.com/PostHog/posthog/blob/master/docs/safe-django-migrations.md"
+SAFE_MIGRATIONS_DOCS_URL = (
+    "https://github.com/PostHog/posthog/blob/master/docs/published/handbook/engineering/safe-django-migrations.md"
+)
 
 
 def is_unmanaged_model(op, migration, unapplied_migrations=None) -> bool:
@@ -376,6 +378,22 @@ class AddIndexAnalyzer(OperationAnalyzer):
             type=self.operation_type,
             score=0,
             reason="Concurrent index is safe",
+            details={"model": model_name},
+        )
+
+
+class AddIndexConcurrentlyAnalyzer(OperationAnalyzer):
+    """Analyzer for AddIndexConcurrently - always safe as it's designed for non-locking index creation."""
+
+    operation_type = "AddIndexConcurrently"
+    default_score = 0
+
+    def analyze(self, op) -> OperationRisk:
+        model_name = getattr(op, "model_name", None)
+        return OperationRisk(
+            type=self.operation_type,
+            score=0,
+            reason="Concurrent index creation is safe (non-blocking)",
             details={"model": model_name},
         )
 
@@ -823,6 +841,21 @@ class RemoveIndexAnalyzer(OperationAnalyzer):
             type=self.operation_type,
             score=0,
             reason="Removing index is safe (doesn't block reads/writes)",
+            details={"model": op.model_name if hasattr(op, "model_name") else "unknown"},
+        )
+
+
+class RemoveIndexConcurrentlyAnalyzer(OperationAnalyzer):
+    """Analyzer for RemoveIndexConcurrently - safe non-blocking index removal."""
+
+    operation_type = "RemoveIndexConcurrently"
+    default_score = 0
+
+    def analyze(self, op) -> OperationRisk:
+        return OperationRisk(
+            type=self.operation_type,
+            score=0,
+            reason="Concurrent index removal is safe (non-blocking)",
             details={"model": op.model_name if hasattr(op, "model_name") else "unknown"},
         )
 

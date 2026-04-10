@@ -1,3 +1,5 @@
+import { MOCK_TEAM_ID } from 'lib/api.mock'
+
 import { router } from 'kea-router'
 import { expectLogic } from 'kea-test-utils'
 
@@ -18,7 +20,7 @@ describe('ExperimentForm Integration', () => {
 
         useMocks({
             post: {
-                '/api/projects/@current/experiments': async (req) => {
+                [`/api/projects/${MOCK_TEAM_ID}/experiments`]: async (req) => {
                     const body = (await req.json()) as Experiment
                     return [
                         200,
@@ -33,7 +35,7 @@ describe('ExperimentForm Integration', () => {
                 },
             },
             patch: {
-                '/api/environments/@current/add_product_intent/': () => [200, {}],
+                '/api/environments/:team_id/add_product_intent/': () => [200, {}],
             },
         })
         initKeaTests()
@@ -110,7 +112,7 @@ describe('ExperimentForm Integration', () => {
     })
 
     describe('full submission flow', () => {
-        it('successfully submits valid experiment and navigates', async () => {
+        it('successfully submits valid experiment and navigates to view page', async () => {
             await expectLogic(logic, () => {
                 logic.actions.setExperiment({
                     ...NEW_EXPERIMENT,
@@ -149,6 +151,34 @@ describe('ExperimentForm Integration', () => {
                 .toMatchValues({
                     experimentErrors: {},
                 })
+        })
+
+        it('still prevents submission if data remains invalid after clearing old errors', async () => {
+            // First attempt - missing name
+            await expectLogic(logic, () => {
+                logic.actions.setExperiment({ ...NEW_EXPERIMENT, name: '' })
+                logic.actions.saveExperiment()
+            })
+                .toDispatchActions(['saveExperiment', 'saveExperimentFailure'])
+                .toMatchValues({
+                    experimentErrors: expect.objectContaining({
+                        name: 'Name is required',
+                    }),
+                })
+
+            // Second attempt - has name but missing feature_flag_key (still invalid)
+            await expectLogic(logic, () => {
+                logic.actions.setExperiment({
+                    ...NEW_EXPERIMENT,
+                    name: 'Valid Name',
+                    description: 'Valid Description',
+                    feature_flag_key: '', // Missing - should still fail
+                })
+                logic.actions.saveExperiment()
+            }).toDispatchActions(['saveExperiment', 'saveExperimentFailure'])
+
+            // Verify it didn't succeed
+            expect(routerPushSpy).not.toHaveBeenCalled()
         })
     })
 })

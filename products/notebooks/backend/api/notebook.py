@@ -5,7 +5,7 @@ from typing import Any, Optional
 
 from django.db import transaction
 from django.db.models import Q, QuerySet
-from django.http import JsonResponse
+from django.http import JsonResponse, StreamingHttpResponse
 from django.utils.timezone import now
 
 import structlog
@@ -18,6 +18,8 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.serializers import BaseSerializer
 
+from posthog.hogql.query import execute_hogql_query
+
 from posthog.api.forbid_destroy_model import ForbidDestroyModel
 from posthog.api.routing import TeamAndOrgViewSetMixin
 from posthog.api.shared import UserBasicSerializer
@@ -29,6 +31,8 @@ from posthog.models.activity_logging.activity_page import activity_page_response
 from posthog.models.utils import UUIDT
 from posthog.rbac.access_control_api_mixin import AccessControlViewSetMixin
 from posthog.rbac.user_access_control import UserAccessControlSerializerMixin
+from posthog.renderers import SafeJSONRenderer, ServerSentEventRenderer
+from posthog.settings import SERVER_GATEWAY_INTERFACE
 from posthog.utils import relative_date_parse
 
 from products.notebooks.backend.kernel_runtime import build_notebook_sandbox_config, get_kernel_runtime
@@ -36,6 +40,8 @@ from products.notebooks.backend.models import KernelRuntime, Notebook
 from products.notebooks.backend.python_analysis import analyze_python_globals, annotate_python_nodes
 from products.tasks.backend.services.sandbox import SandboxStatus
 from products.tasks.backend.temporal.exceptions import SandboxProvisionError
+
+from ee.hogai.utils.asgi import SyncIterableToAsync
 
 logger = structlog.get_logger(__name__)
 
@@ -74,6 +80,14 @@ def log_notebook_activity(
     )
 
 
+_NOTEBOOK_FIELD_HELP_TEXTS = {
+    "id": {"help_text": "UUID of the notebook."},
+    "short_id": {"help_text": "Short alphanumeric identifier used in URLs and API lookups."},
+    "title": {"help_text": "Title of the notebook."},
+    "deleted": {"help_text": "Whether the notebook has been soft-deleted."},
+}
+
+
 class NotebookMinimalSerializer(serializers.ModelSerializer, UserAccessControlSerializerMixin):
     created_by = UserBasicSerializer(read_only=True)
     last_modified_by = UserBasicSerializer(read_only=True)
@@ -94,6 +108,7 @@ class NotebookMinimalSerializer(serializers.ModelSerializer, UserAccessControlSe
             "_create_in_folder",
         ]
         read_only_fields = fields
+        extra_kwargs = _NOTEBOOK_FIELD_HELP_TEXTS
 
 
 class NotebookSerializer(NotebookMinimalSerializer):
@@ -123,10 +138,27 @@ class NotebookSerializer(NotebookMinimalSerializer):
             "last_modified_by",
             "user_access_level",
         ]
+        extra_kwargs = {
+            **_NOTEBOOK_FIELD_HELP_TEXTS,
+            "content": {"help_text": "Notebook content as a ProseMirror JSON document structure."},
+            "text_content": {"help_text": "Plain text representation of the notebook content for search."},
+            "version": {
+                "help_text": "Version number for optimistic concurrency control. Must match the current version when updating content."
+            },
+        }
 
     def create(self, validated_data: dict, *args, **kwargs) -> Notebook:
         request = self.context["request"]
         team = self.context["get_team"]()
+
+        # short_id is read-only in the serializer but can be provided on create
+        short_id = request.data.get("short_id")
+        if short_id:
+            if not isinstance(short_id, str) or not short_id.isalnum() or len(short_id) > 12:
+                raise serializers.ValidationError(
+                    {"short_id": "short_id must be an alphanumeric string up to 12 characters."}
+                )
+            validated_data["short_id"] = short_id
 
         created_by = validated_data.pop("created_by", request.user)
         content = validated_data.get("content")
@@ -202,6 +234,10 @@ class NotebookKernelExecuteSerializer(serializers.Serializer):
     timeout = serializers.FloatField(required=False, min_value=0.1, max_value=120)
 
 
+class NotebookHogQLExecuteSerializer(serializers.Serializer):
+    query = serializers.CharField(allow_blank=True)
+
+
 class NotebookKernelDataframeSerializer(serializers.Serializer):
     variable_name = serializers.CharField()
     offset = serializers.IntegerField(default=0, min_value=0)
@@ -243,6 +279,16 @@ class NotebookKernelConfigSerializer(serializers.Serializer):
         if not attrs:
             raise serializers.ValidationError("Provide at least one kernel configuration option.")
         return attrs
+
+
+def _format_hogql_response_payload(response: Any) -> dict[str, Any]:
+    if hasattr(response, "model_dump"):
+        response_payload = response.model_dump(exclude_none=True)
+    else:
+        response_payload = response.dict(exclude_none=True)
+    for key in ("clickhouse", "hogql", "timings", "modifiers"):
+        response_payload.pop(key, None)
+    return response_payload
 
 
 @extend_schema(
@@ -312,13 +358,15 @@ class NotebookViewSet(TeamAndOrgViewSetMixin, AccessControlViewSetMixin, ForbidD
 
     def _get_notebook_for_kernel(self) -> Notebook:
         if self.kwargs.get(self.lookup_field) == "scratchpad":
-            return Notebook(
+            notebook = Notebook(
                 short_id="scratchpad",
                 team=self.team,
                 created_by=self.request.user,
                 last_modified_by=self.request.user,
                 visibility=Notebook.Visibility.INTERNAL,
             )
+            self.check_object_permissions(self.request, notebook)
+            return notebook
 
         return self.get_object()
 
@@ -358,7 +406,7 @@ class NotebookViewSet(TeamAndOrgViewSetMixin, AccessControlViewSetMixin, ForbidD
                 queryset = queryset.filter(last_modified_at__gt=relative_date_parse(value, self.team.timezone_info))
             elif key == "date_to" and isinstance(value, str):
                 queryset = queryset.filter(last_modified_at__lt=relative_date_parse(value, self.team.timezone_info))
-            elif key == "search":
+            elif key == "search" and value:
                 queryset = queryset.filter(
                     # some notebooks have no text_content until next saved, so we need to check the title too
                     # TODO this can be removed once all/most notebooks have text_content
@@ -582,6 +630,68 @@ class NotebookViewSet(TeamAndOrgViewSetMixin, AccessControlViewSetMixin, ForbidD
 
         return Response(execution.as_dict())
 
+    @action(methods=["POST"], url_path="hogql/execute", detail=True)
+    def hogql_execute(self, request: Request, **kwargs):
+        serializer = NotebookHogQLExecuteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        notebook = self._get_notebook_for_kernel()
+
+        try:
+            response = execute_hogql_query(query=serializer.validated_data["query"], team=self.team)
+        except Exception as err:
+            logger.exception("notebook_hogql_execute_failed", notebook_short_id=notebook.short_id)
+            return Response({"error": str(err)}, status=400)
+
+        return Response(_format_hogql_response_payload(response))
+
+    @action(
+        methods=["POST"],
+        url_path="kernel/execute/stream",
+        detail=True,
+        renderer_classes=[ServerSentEventRenderer],
+    )
+    def kernel_execute_stream(self, request: Request, **kwargs):
+        serializer = NotebookKernelExecuteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        notebook = self._get_notebook_for_kernel()
+
+        analysis = analyze_python_globals(serializer.validated_data["code"])
+        variable_names = [entry["name"] for entry in analysis.exported_with_types]
+        renderer = SafeJSONRenderer()
+
+        def stream():
+            try:
+                for event in get_kernel_runtime(notebook, self._current_user()).execute_stream(
+                    serializer.validated_data["code"],
+                    capture_variables=serializer.validated_data.get("return_variables", True),
+                    variable_names=variable_names,
+                    timeout=serializer.validated_data.get("timeout"),
+                ):
+                    if event["type"] == "result":
+                        payload = event["data"]
+                    else:
+                        payload = {"text": event.get("text", "")}
+                    payload_json = renderer.render(payload).decode()
+                    yield f"event: {event['type']}\ndata: {payload_json}\n\n".encode()
+            except SandboxProvisionError:
+                logger.exception("notebook_kernel_execute_failed", notebook_short_id=notebook.short_id)
+                payload = {"error": "Failed to execute notebook code."}
+                payload_json = renderer.render(payload).decode()
+                yield f"event: error\ndata: {payload_json}\n\n".encode()
+            except RuntimeError:
+                logger.exception("notebook_kernel_execute_failed", notebook_short_id=notebook.short_id)
+                payload = {"error": "Failed to execute notebook code."}
+                payload_json = renderer.render(payload).decode()
+                yield f"event: error\ndata: {payload_json}\n\n".encode()
+
+        streaming_content = SyncIterableToAsync(stream()) if SERVER_GATEWAY_INTERFACE == "ASGI" else stream()
+        response = StreamingHttpResponse(
+            streaming_content=streaming_content, content_type=ServerSentEventRenderer.media_type
+        )
+        response["Cache-Control"] = "no-cache"
+        response["X-Accel-Buffering"] = "no"
+        return response
+
     @action(methods=["GET"], url_path="kernel/dataframe", detail=True)
     def kernel_dataframe(self, request: Request, **kwargs):
         serializer = NotebookKernelDataframeSerializer(data=request.query_params)
@@ -616,7 +726,7 @@ class NotebookViewSet(TeamAndOrgViewSetMixin, AccessControlViewSetMixin, ForbidD
         if not recording_id:
             return Response({"detail": "recording_id is required"}, status=400)
 
-        queryset = self.safely_get_queryset(self.queryset)
+        queryset = self.get_queryset()
         queryset = self._filter_list_request(request, queryset, {"contains": f"recording:{recording_id}"})
         notebooks = queryset.all()
         comments = []

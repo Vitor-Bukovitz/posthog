@@ -16,8 +16,8 @@ import { SessionRecordingSidebarStacking, SessionRecordingSidebarTab } from '~/t
 
 import { playerSettingsLogic } from './playerSettingsLogic'
 import { sessionRecordingPlayerLogic } from './sessionRecordingPlayerLogic'
-import { PlayerSidebarTab } from './sidebar/PlayerSidebarTab'
 import { playerSidebarLogic } from './sidebar/playerSidebarLogic'
+import { PlayerSidebarTab } from './sidebar/PlayerSidebarTab'
 
 export function PlayerSidebar(): JSX.Element {
     const ref = useRef<HTMLDivElement>(null)
@@ -55,14 +55,12 @@ export function PlayerSidebar(): JSX.Element {
         sidebarTabs.splice(1, 0, SessionRecordingSidebarTab.SESSION_SUMMARY)
     }
 
-    // Show linked issues tab if the flag is enabled AND there are integrations or existing references
-    if (featureFlags[FEATURE_FLAGS.REPLAY_LINEAR_INTEGRATION]) {
-        const sessionReplayIntegrations = getIntegrationsByKind(['linear', 'github'])
-        const externalReferences = sessionPlayerMetaData?.external_references ?? []
+    // Show linked issues tab if there are integrations or existing references
+    const sessionReplayIntegrations = getIntegrationsByKind(['linear', 'github', 'gitlab', 'jira'])
+    const externalReferences = sessionPlayerMetaData?.external_references ?? []
 
-        if (sessionReplayIntegrations.length > 0 || externalReferences.length > 0) {
-            sidebarTabs.push(SessionRecordingSidebarTab.LINKED_ISSUES)
-        }
+    if (sessionReplayIntegrations.length > 0 || externalReferences.length > 0) {
+        sidebarTabs.push(SessionRecordingSidebarTab.LINKED_ISSUES)
     }
 
     return (
@@ -110,7 +108,7 @@ export function PlayerSidebar(): JSX.Element {
                             })}
                             barClassName="!mb-0"
                             size="small"
-                            className="overflow-x-auto"
+                            className="overflow-x-auto hide-scrollbar"
                         />
                         <div className="flex flex-1 border-b shrink-0" />
                         <div className="flex gap-1 border-b end">

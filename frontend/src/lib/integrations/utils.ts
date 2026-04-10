@@ -15,10 +15,12 @@ import IconGoogleCloud from 'public/services/google-cloud.png'
 import IconGoogleSheets from 'public/services/google-sheets.svg'
 import IconHubspot from 'public/services/hubspot.png'
 import IconIntercom from 'public/services/intercom.png'
+import IconJira from 'public/services/jira.svg'
 import IconLinear from 'public/services/linear.png'
 import IconLinkedIn from 'public/services/linkedin.png'
 import IconMailjet from 'public/services/mailjet.png'
 import IconMetaAds from 'public/services/meta-ads.png'
+import IconPinterest from 'public/services/pinterest_ads.png'
 import IconReddit from 'public/services/reddit.png'
 import IconSalesforce from 'public/services/salesforce.png'
 import IconSlack from 'public/services/slack.png'
@@ -29,10 +31,12 @@ import IconVercel from 'public/services/vercel.png'
 
 export const ICONS: Record<IntegrationKind, any> = {
     slack: IconSlack,
+    'slack-posthog-code': IconSlack,
     salesforce: IconSalesforce,
     hubspot: IconHubspot,
     'google-pubsub': IconGoogleCloud,
     'google-cloud-storage': IconGoogleCloudStorage,
+    'google-cloud-service-account': IconGoogleCloud,
     'google-ads': IconGoogleAds,
     'google-sheets': IconGoogleSheets,
     snapchat: IconSnapchat,
@@ -52,16 +56,22 @@ export const ICONS: Record<IntegrationKind, any> = {
     vercel: IconVercel,
     'azure-blob': IconAzureBlob,
     firebase: IconFirebase,
+    jira: IconJira,
+    'pinterest-ads': IconPinterest,
 }
 
 export const getIntegrationNameFromKind = (kind: string): string => {
     switch (kind) {
+        case 'slack-posthog-code':
+            return 'PostHog Code (Slack)'
         case 'google-pubsub':
             return 'Google Cloud Pub/Sub'
         case 'google-cloud-storage':
             return 'Google Cloud Storage'
         case 'google-ads':
             return 'Google Ads'
+        case 'google-cloud-service-account':
+            return 'Google Cloud service account'
         case 'linkedin-ads':
             return 'LinkedIn Ads'
         case 'reddit-ads':
@@ -72,6 +82,8 @@ export const getIntegrationNameFromKind = (kind: string): string => {
             return 'Bing Ads'
         case 'azure-blob':
             return 'Azure Blob Storage'
+        case 'pinterest-ads':
+            return 'Pinterest Ads'
         case 'email':
             return 'email'
         case 'github':

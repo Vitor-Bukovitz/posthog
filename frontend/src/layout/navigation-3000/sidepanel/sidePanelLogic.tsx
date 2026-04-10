@@ -1,30 +1,22 @@
 import { connect, kea, path, selectors } from 'kea'
 import { combineUrl, router, urlToAction } from 'kea-router'
 
-import { dayjs } from 'lib/dayjs'
 import { preflightLogic } from 'scenes/PreflightCheck/preflightLogic'
 import { teamLogic } from 'scenes/teamLogic'
 import { urls } from 'scenes/urls'
-import { userLogic } from 'scenes/userLogic'
 
-import { activationLogic } from '~/layout/navigation-3000/sidepanel/panels/activation/activationLogic'
-import { sidePanelNotificationsLogic } from '~/layout/navigation-3000/sidepanel/panels/activity/sidePanelNotificationsLogic'
-import { AvailableFeature, SidePanelTab } from '~/types'
+import { SidePanelTab } from '~/types'
 
 import { sidePanelContextLogic } from './panels/sidePanelContextLogic'
 import { sidePanelHealthLogic } from './panels/sidePanelHealthLogic'
-import { sidePanelSdkDoctorLogic } from './panels/sidePanelSdkDoctorLogic'
 import { sidePanelStatusIncidentIoLogic } from './panels/sidePanelStatusIncidentIoLogic'
-import { sidePanelStatusLogic } from './panels/sidePanelStatusLogic'
 import type { sidePanelLogicType } from './sidePanelLogicType'
 import { sidePanelStateLogic } from './sidePanelStateLogic'
 
 const ALWAYS_EXTRA_TABS = [
     SidePanelTab.Settings,
-    SidePanelTab.Activity,
     SidePanelTab.Status,
     SidePanelTab.Exports,
-    SidePanelTab.SdkDoctor,
     SidePanelTab.Health,
     SidePanelTab.Changelog,
 ]
@@ -34,7 +26,6 @@ const TABS_REQUIRING_A_TEAM = [
     SidePanelTab.Notebooks,
 
     SidePanelTab.Activity,
-    SidePanelTab.Activation,
     SidePanelTab.Discussion,
     SidePanelTab.AccessControl,
     SidePanelTab.Exports,
@@ -50,23 +41,12 @@ export const sidePanelLogic = kea<sidePanelLogicType>([
         values: [
             preflightLogic,
             ['isCloudOrDev'],
-            activationLogic,
-            ['shouldShowActivationTab'],
             sidePanelStateLogic,
             ['selectedTab', 'sidePanelOpen'],
-            // We need to mount this to ensure that marking as read works when the panel closes
-            sidePanelNotificationsLogic,
-            ['unreadCount'],
-            sidePanelStatusLogic,
-            ['status'],
             sidePanelStatusIncidentIoLogic,
-            ['status as incidentioStatus'],
-            sidePanelSdkDoctorLogic,
-            ['needsAttention'],
+            ['status'],
             sidePanelHealthLogic,
             ['hasIssues'],
-            userLogic,
-            ['hasAvailableFeature'],
             sidePanelContextLogic,
             ['sceneSidePanelContext'],
             teamLogic,
@@ -91,22 +71,15 @@ export const sidePanelLogic = kea<sidePanelLogicType>([
                     tabs.push(SidePanelTab.Status)
                 }
 
-                // Quick start is shown in the sidebar for the first 90 days of a team's existence
-                if (currentTeam?.created_at) {
-                    const teamCreatedAt = dayjs(currentTeam.created_at)
-
-                    if (dayjs().diff(teamCreatedAt, 'day') < 90) {
-                        tabs.push(SidePanelTab.Activation)
-                    }
-                }
-
                 tabs.push(SidePanelTab.Notebooks)
                 tabs.push(SidePanelTab.Docs)
                 if (isCloudOrDev) {
                     tabs.push(SidePanelTab.Support)
                 }
 
-                tabs.push(SidePanelTab.Activity)
+                if (sceneSidePanelContext?.activity_scope) {
+                    tabs.push(SidePanelTab.Activity)
+                }
                 tabs.push(SidePanelTab.Discussion)
 
                 if (sceneSidePanelContext.access_control_resource && sceneSidePanelContext.access_control_resource_id) {
@@ -115,9 +88,6 @@ export const sidePanelLogic = kea<sidePanelLogicType>([
 
                 tabs.push(SidePanelTab.Exports)
                 tabs.push(SidePanelTab.Settings)
-                if (isCloudOrDev) {
-                    tabs.push(SidePanelTab.SdkDoctor)
-                }
                 tabs.push(SidePanelTab.Health)
                 tabs.push(SidePanelTab.Changelog)
 
@@ -130,60 +100,19 @@ export const sidePanelLogic = kea<sidePanelLogicType>([
         ],
 
         visibleTabs: [
-            (s) => [
-                s.enabledTabs,
-                s.selectedTab,
-                s.sidePanelOpen,
-                s.unreadCount,
-                s.status,
-                s.incidentioStatus,
-                s.needsAttention,
-                s.hasIssues,
-                s.hasAvailableFeature,
-                s.shouldShowActivationTab,
-            ],
-            (
-                enabledTabs,
-                selectedTab,
-                sidePanelOpen,
-                unreadCount,
-                status,
-                incidentioStatus,
-                needsAttention,
-                hasIssues,
-                hasAvailableFeature,
-                shouldShowActivationTab
-            ): SidePanelTab[] => {
+            (s) => [s.enabledTabs, s.selectedTab, s.sidePanelOpen, s.status, s.hasIssues],
+            (enabledTabs, selectedTab, sidePanelOpen, status, hasIssues): SidePanelTab[] => {
                 return enabledTabs.filter((tab) => {
                     if (tab === selectedTab && sidePanelOpen) {
                         return true
                     }
 
-                    if (
-                        tab === SidePanelTab.Activity &&
-                        unreadCount &&
-                        hasAvailableFeature(AvailableFeature.AUDIT_LOGS)
-                    ) {
-                        return true
-                    }
-
-                    if (
-                        tab === SidePanelTab.Status &&
-                        (status !== 'operational' || incidentioStatus !== 'operational')
-                    ) {
-                        return true
-                    }
-
-                    if (tab === SidePanelTab.SdkDoctor && needsAttention) {
+                    if (tab === SidePanelTab.Status && status !== 'operational') {
                         return true
                     }
 
                     if (tab === SidePanelTab.Health && hasIssues) {
                         return true
-                    }
-
-                    if (tab === SidePanelTab.Activation && !shouldShowActivationTab) {
-                        return false
                     }
 
                     // Hide certain tabs unless they are selected

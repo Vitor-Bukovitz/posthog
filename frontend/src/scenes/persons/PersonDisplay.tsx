@@ -12,12 +12,14 @@ import { ProfilePicture, ProfilePictureProps } from 'lib/lemon-ui/ProfilePicture
 import { copyToClipboard } from 'lib/utils/copyToClipboard'
 import { useNotebookNode } from 'scenes/notebooks/Nodes/NotebookNodeContext'
 
+import { PersonPropType, asDisplay, asLink, getPersonColorIndex } from './person-utils'
 import { PersonPreview } from './PersonPreview'
-import { PersonPropType, asDisplay, asLink } from './person-utils'
 
 export interface PersonDisplayProps {
     person?: PersonPropType | null
     displayName?: string
+    /** Max display name length before mid-ellipsis truncation. Passed to `asDisplay`. */
+    maxLength?: number
     withIcon?: boolean | ProfilePictureProps['size']
     href?: string
     noLink?: boolean
@@ -36,6 +38,7 @@ export interface PersonDisplayProps {
 export function PersonIcon({
     person,
     displayName,
+    index,
     ...props
 }: Pick<PersonDisplayProps, 'person'> &
     Omit<ProfilePictureProps, 'user' | 'name' | 'email'> & { displayName?: string }): JSX.Element {
@@ -49,9 +52,14 @@ export function PersonIcon({
         return typeof possibleEmail === 'string' ? possibleEmail : undefined
     }, [person?.properties?.email])
 
+    // Generate a stable color index from the person's distinct_id (or display name) if not explicitly provided
+    const identifier = person?.distinct_id || person?.distinct_ids?.[0] || displayName
+    const colorIndex = useMemo(() => index ?? getPersonColorIndex(identifier), [index, identifier])
+
     return (
         <ProfilePicture
             {...props}
+            index={colorIndex}
             user={{
                 first_name: display,
                 email,
@@ -63,6 +71,7 @@ export function PersonIcon({
 export function PersonDisplay({
     person,
     displayName,
+    maxLength,
     withIcon,
     noEllipsis,
     noPopover,
@@ -76,7 +85,7 @@ export function PersonDisplay({
     className,
     muted,
 }: PersonDisplayProps): JSX.Element {
-    const display = displayName || asDisplay(person)
+    const display = displayName || asDisplay(person, maxLength)
     const [visible, setVisible] = useState(false)
 
     const notebookNode = useNotebookNode()
@@ -152,8 +161,8 @@ export function PersonDisplay({
             showArrow
         >
             {withCopyButton ? (
-                <div className="flex flex-row items-center justify-between gap-2 min-w-0">
-                    <span className="min-w-0 flex-1">{content}</span>
+                <div className="flex flex-row items-center gap-1 min-w-0">
+                    <span className="min-w-0 truncate">{content}</span>
                     <IconCopy
                         className="text-lg cursor-pointer shrink-0"
                         onClick={() => void copyToClipboard(display)}

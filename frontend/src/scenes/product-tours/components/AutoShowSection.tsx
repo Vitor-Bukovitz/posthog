@@ -16,18 +16,20 @@ import {
 import { EventSelect } from 'lib/components/EventSelect/EventSelect'
 import { PropertyFilters } from 'lib/components/PropertyFilters/PropertyFilters'
 import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
+import { toSentenceCase } from 'lib/utils'
 import { AddEventButton } from 'scenes/surveys/AddEventButton'
+import { SurveyMatchTypeLabels } from 'scenes/surveys/constants'
 import {
     SUPPORTED_OPERATORS,
     convertArrayToPropertyFilters,
     convertPropertyFiltersToArray,
 } from 'scenes/surveys/SurveyEventTrigger'
-import { SurveyMatchTypeLabels } from 'scenes/surveys/constants'
 
 import { propertyDefinitionsModel } from '~/models/propertyDefinitionsModel'
 import {
     ActionType,
     AnyPropertyFilter,
+    EffectiveProductTourType,
     ProductTourDisplayConditions,
     ProductTourDisplayFrequency,
     PropertyDefinitionType,
@@ -41,10 +43,12 @@ import { getDefaultDisplayFrequency, getDisplayFrequencyOptions, isAnnouncement 
 
 type TourTriggerType = 'immediate' | 'event' | 'action'
 
-interface AutoShowSectionProps {
-    conditions: ProductTourDisplayConditions
-    onChange: (conditions: ProductTourDisplayConditions) => void
-}
+const ALL_TOUR_TYPES: EffectiveProductTourType[] = ['tour', 'announcement', 'banner']
+
+const TOUR_TYPE_OPTIONS = ALL_TOUR_TYPES.map((type) => ({
+    key: type,
+    label: toSentenceCase(type),
+}))
 
 /**
  * this should probably be re-used from surveys!!
@@ -57,7 +61,18 @@ interface AutoShowSectionProps {
  * xoxo,
  * @adboio
  */
-function EventTriggerContent({ conditions, onChange }: AutoShowSectionProps): JSX.Element {
+function EventTriggerContent({ id }: { id: string }): JSX.Element {
+    const { productTourForm } = useValues(productTourLogic({ id }))
+    const { setProductTourFormValue } = useActions(productTourLogic({ id }))
+
+    const conditions = productTourForm.content?.conditions || {}
+
+    const onChange = (newConditions: ProductTourDisplayConditions): void => {
+        setProductTourFormValue('content', {
+            ...productTourForm.content,
+            conditions: newConditions,
+        })
+    }
     const { propertyDefinitionsByType } = useValues(propertyDefinitionsModel)
 
     const excludedObjectProperties = useMemo(() => {
@@ -182,9 +197,18 @@ function EventTriggerContent({ conditions, onChange }: AutoShowSectionProps): JS
     )
 }
 
-export function AutoShowSection({ conditions, onChange }: AutoShowSectionProps): JSX.Element | null {
-    const { productTourForm, productTour } = useValues(productTourLogic)
-    const { setProductTourFormValue } = useActions(productTourLogic)
+export function AutoShowSection({ id }: { id: string }): JSX.Element | null {
+    const { productTourForm, productTour, entityKeyword } = useValues(productTourLogic({ id }))
+    const { setProductTourFormValue } = useActions(productTourLogic({ id }))
+
+    const conditions = productTourForm.content?.conditions || {}
+
+    const onChange = (newConditions: ProductTourDisplayConditions): void => {
+        setProductTourFormValue('content', {
+            ...productTourForm.content,
+            conditions: newConditions,
+        })
+    }
 
     // Load recent URLs from property definitions
     const { options } = useValues(propertyDefinitionsModel)
@@ -250,8 +274,8 @@ export function AutoShowSection({ conditions, onChange }: AutoShowSectionProps):
 
     return (
         <div className="space-y-4">
-            <div>
-                <h5 className="font-semibold mb-2">Where to show</h5>
+            <div className="flex flex-col gap-3">
+                <h5 className="font-semibold mb-0">Where to show</h5>
                 <div className="flex gap-2 items-center">
                     <span className="text-sm whitespace-nowrap">URL</span>
                     <LemonSelect
@@ -309,12 +333,44 @@ export function AutoShowSection({ conditions, onChange }: AutoShowSectionProps):
                         />
                     )}
                 </div>
+                {conditions.urlMatchType === SurveyMatchType.Exact && (
+                    <span className="text-xs text-muted">Trailing slashes are stripped when matching exact URLs.</span>
+                )}
+                <div className="flex gap-2 items-center">
+                    <span className="text-sm whitespace-nowrap">Device types</span>
+                    <LemonInputSelect
+                        mode="multiple"
+                        value={conditions.deviceTypes || []}
+                        onChange={(values) => {
+                            onChange({ ...conditions, deviceTypes: values })
+                        }}
+                        options={[
+                            {
+                                key: 'Desktop',
+                                label: 'Desktop',
+                            },
+                            {
+                                key: 'Tablet',
+                                label: 'Tablet',
+                            },
+                            {
+                                key: 'Mobile',
+                                label: 'Mobile',
+                            },
+                        ]}
+                        placeholder="Select devices..."
+                        disablePrompting
+                        size="small"
+                    />
+                </div>
             </div>
 
             <div>
                 <h5 className="font-semibold mb-2">
                     When to show&nbsp;
-                    <Tooltip title="Choose when to show the tour to matching users.">
+                    <Tooltip
+                        title={`By default, ${entityKeyword}s will show on page load when a user matches your conditions. Alternatively, you can wait to show this tour until the user performs an event or action.`}
+                    >
                         <IconInfo />
                     </Tooltip>
                 </h5>
@@ -325,7 +381,7 @@ export function AutoShowSection({ conditions, onChange }: AutoShowSectionProps):
                     className="w-full"
                 />
 
-                {triggerType === 'event' && <EventTriggerContent conditions={conditions} onChange={onChange} />}
+                {triggerType === 'event' && <EventTriggerContent id={id} />}
 
                 {triggerType === 'action' && (
                     <div className="mt-3">
@@ -377,7 +433,67 @@ export function AutoShowSection({ conditions, onChange }: AutoShowSectionProps):
                         }}
                         className="w-12"
                     />
-                    <span className="text-sm">seconds before showing the tour after the conditions are met</span>
+                    <span className="text-sm">seconds before showing the {entityKeyword}</span>
+                </div>
+
+                <div className="mt-4">
+                    <div className="flex flex-row gap-2 items-center">
+                        <LemonCheckbox
+                            checked={!!conditions.seenTourWaitPeriod}
+                            onChange={(checked) => {
+                                onChange({
+                                    ...conditions,
+                                    seenTourWaitPeriod: checked ? { days: 7, types: [...ALL_TOUR_TYPES] } : undefined,
+                                })
+                            }}
+                        />
+                        <span className="text-sm">Don't show to users who recently saw another...</span>
+                    </div>
+                    {conditions.seenTourWaitPeriod && (
+                        <div className="ml-7 mt-2 flex flex-row gap-2 items-center">
+                            <div className="w-80 max-w-80">
+                                <LemonInputSelect
+                                    mode="multiple"
+                                    value={conditions.seenTourWaitPeriod.types || []}
+                                    onChange={(values) => {
+                                        onChange({
+                                            ...conditions,
+                                            seenTourWaitPeriod: {
+                                                ...conditions.seenTourWaitPeriod!,
+                                                types: values as EffectiveProductTourType[],
+                                            },
+                                        })
+                                    }}
+                                    options={TOUR_TYPE_OPTIONS}
+                                    placeholder="Select types..."
+                                    disablePrompting
+                                    size="small"
+                                />
+                            </div>
+                            <span className="text-sm whitespace-nowrap">in the last</span>
+                            <LemonInput
+                                type="number"
+                                size="small"
+                                min={1}
+                                max={365}
+                                value={conditions.seenTourWaitPeriod.days ?? NaN}
+                                onChange={(newValue) => {
+                                    if (!conditions.seenTourWaitPeriod) {
+                                        return
+                                    }
+                                    onChange({
+                                        ...conditions,
+                                        seenTourWaitPeriod: {
+                                            ...conditions.seenTourWaitPeriod,
+                                            days: newValue as number,
+                                        },
+                                    })
+                                }}
+                                className="w-12"
+                            />
+                            <span className="text-sm">days</span>
+                        </div>
+                    )}
                 </div>
             </div>
 
@@ -397,8 +513,7 @@ export function AutoShowSection({ conditions, onChange }: AutoShowSectionProps):
                     />
                 ) : (
                     <p>
-                        <IconInfo /> Product tours display once per user, until they interact (complete any steps, or
-                        dismiss the tour).
+                        <IconInfo /> Product tours display once per user, until they interact
                     </p>
                 )}
             </div>

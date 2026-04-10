@@ -4,7 +4,7 @@ import { randomString } from '../../utils'
 import { expect, test } from '../../utils/playwright-test-base'
 
 async function deleteSurvey(page: Page, name: string): Promise<void> {
-    await page.locator('[data-attr=info-actions-panel]').click()
+    await page.locator('[data-attr=open-context-panel-button]').first().click()
     await page.locator('[data-attr=survey-delete]').click()
 
     await expect(page.locator('.LemonModal__layout')).toBeVisible()
@@ -149,8 +149,14 @@ test.describe('CRUD Survey', () => {
 
     test('can set responses limit', async ({ page }) => {
         await expect(page.locator('h1')).toContainText('Surveys')
-        await page.locator('[data-attr=new-survey]').click()
-        await page.locator('[data-attr=new-blank-survey]').click()
+        // This test exercises the full editor's adaptive sampling UI. The
+        // "new survey" URL auto-redirects to whichever editor the user
+        // previously preferred (default: guided wizard), so force the
+        // preference to 'full' before navigating.
+        await page.addInitScript(() => {
+            localStorage.setItem('scenes.surveys.surveysLogic.preferredEditor', JSON.stringify('full'))
+        })
+        await page.goto('/surveys/new')
 
         await page.locator('[data-attr="scene-title-textarea"]').fill(name)
 
@@ -167,7 +173,7 @@ test.describe('CRUD Survey', () => {
         await saveButton.click()
         await saveResponsePromise
 
-        await expect(page.locator('button[data-attr="launch-survey"]')).toContainText('Launch')
+        await expect(page.locator('button[data-attr="launch-survey"]').first()).toContainText('Launch')
 
         await page.reload()
         await expect(page.getByText('The survey will be stopped once 228 responses are received.')).toBeVisible()
@@ -177,8 +183,13 @@ test.describe('CRUD Survey', () => {
 
     test('can set cancellation events', async ({ page }) => {
         await expect(page.locator('h1')).toContainText('Surveys')
-        await page.locator('[data-attr=new-survey]').click()
-        await page.locator('[data-attr=new-blank-survey]').click()
+        // Cancellation events aren't exposed in the guided wizard. Force the
+        // editor preference to 'full' so the /surveys/new redirect doesn't
+        // send us into the wizard.
+        await page.addInitScript(() => {
+            localStorage.setItem('scenes.surveys.surveysLogic.preferredEditor', JSON.stringify('full'))
+        })
+        await page.goto('/surveys/new')
 
         await page.locator('[data-attr="scene-title-textarea"]').fill(name)
 
@@ -195,7 +206,7 @@ test.describe('CRUD Survey', () => {
         await page.locator('span[aria-label="Autocapture"]').getByText('Autocapture').click()
 
         await page.locator('[data-attr=save-survey]').first().click()
-        await expect(page.locator('button[data-attr="launch-survey"]')).toContainText('Launch')
+        await expect(page.locator('button[data-attr="launch-survey"]').first()).toContainText('Launch')
 
         await page.locator('.LemonTabs__tab').getByText('Overview').click()
         await expect(page.getByText('Delay before showing: 5 seconds')).toBeVisible()

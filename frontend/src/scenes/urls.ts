@@ -8,7 +8,6 @@ import { ActivityTab, AnnotationType, CommentType, OnboardingStepKey, SDKKey } f
 
 import type { BillingSectionId } from './billing/types'
 import { DataPipelinesNewSceneKind } from './data-pipelines/DataPipelinesNewScene'
-import type { DataPipelinesSceneTab } from './data-pipelines/DataPipelinesScene'
 import { OutputTab } from './data-warehouse/editor/outputPaneLogic'
 import type { DataWarehouseSourceSceneTab } from './data-warehouse/settings/DataWarehouseSourceScene'
 import type { HogFunctionSceneTab } from './hog-functions/HogFunctionScene'
@@ -42,6 +41,12 @@ export const urls = {
     dataManagementHistory: (): string => '/data-management/history',
     database: (): string => '/data-management/database',
     dataWarehouseManagedViewsets: (): string => '/data-management/managed-viewsets',
+    webScripts: (): string => '/web-scripts',
+    webScriptsNew: (): string => '/web-scripts/new',
+    destinations: (): string => '/data-management/destinations',
+    models: (): string => '/models',
+    sources: (): string => '/data-management/sources',
+    transformations: (): string => '/data-management/transformations',
     activity: (tab: ActivityTab | ':tab' = ActivityTab.ExploreEvents): string => `/activity/${tab}`,
     event: (id: string, timestamp: string): string =>
         `/events/${encodeURIComponent(id)}/${encodeURIComponent(timestamp)}`,
@@ -51,14 +56,27 @@ export const urls = {
     marketingAnalytics: (): string => '/data-management/marketing-analytics',
     marketingAnalyticsApp: (): string => '/marketing',
     customCss: (): string => '/themes/custom-css',
-    sqlEditor: (
-        query?: string,
-        view_id?: string,
-        insightShortId?: string,
-        draftId?: string,
-        outputTab?: OutputTab,
+    sqlEditor: ({
+        query,
+        view_id,
+        insightShortId,
+        draftId,
+        outputTab,
+        endpointName,
+        source,
+        connectionId,
+        dashboard,
+    }: {
+        query?: string
+        view_id?: string
+        insightShortId?: string
+        draftId?: string
+        outputTab?: OutputTab
         endpointName?: string
-    ): string => {
+        source?: string
+        connectionId?: string
+        dashboard?: number
+    } = {}): string => {
         const params = new URLSearchParams()
 
         if (query) {
@@ -79,13 +97,32 @@ export const urls = {
             params.set('endpoint_name', endpointName)
         }
 
+        if (source) {
+            params.set('source', source)
+        }
+
+        if (dashboard) {
+            params.set('dashboard', String(dashboard))
+        }
+
         const queryString = params.toString()
-        return `/sql${queryString ? `?${queryString}` : ''}`
+        const hashParams = new URLSearchParams()
+        if (connectionId) {
+            hashParams.set('c', connectionId)
+        }
+
+        const hashString = hashParams.toString()
+        return `/sql${queryString ? `?${queryString}` : ''}${hashString ? `#${hashString}` : ''}`
     },
     annotations: (): string => '/data-management/annotations',
     annotation: (id: AnnotationType['id'] | ':id'): string => `/data-management/annotations/${id}`,
     comments: (): string => '/data-management/comments',
     comment: (id: CommentType['id'] | ':id'): string => `/data-management/comments/${id}`,
+    variables: (): string => '/data-management/variables',
+    variable: (id: string | ':id'): string => `/data-management/variables/${id}`,
+    variableEdit: (id: string | ':id'): string => `/data-management/variables/${id}/edit`,
+    resourceTransfer: (resourceKind: string, resourceId: string | number): string =>
+        `/resource-transfer/${resourceKind}/${resourceId}`,
     organizationCreateFirst: (): string => '/create-organization',
     projectCreateFirst: (): string => '/organization/create-project',
     projectRoot: (): string => '/',
@@ -102,14 +139,17 @@ export const urls = {
     login2FA: (): string => '/login/2fa',
     login2FASetup: (): string => '/login/2fa_setup',
     cliAuthorize: (): string => '/cli/authorize',
+    cliLive: (): string => '/cli/live',
     emailMFAVerify: (): string => '/login/verify',
     liveDebugger: (): string => '/live-debugger',
     passwordReset: (): string => '/reset',
     passwordResetComplete: (userUuid: string, token: string): string => `/reset/${userUuid}/${token}`,
+    twoFactorReset: (userUuid: string, token: string): string => `/reset_2fa/${userUuid}/${token}`,
     preflight: (): string => '/preflight',
     signup: (): string => '/signup',
     verifyEmail: (userUuid: string = '', token: string = ''): string =>
         `/verify_email${userUuid ? `/${userUuid}` : ''}${token ? `/${token}` : ''}`,
+    vercelConnect: (): string => '/connect/vercel/link',
     vercelLinkError: (): string => '/integrations/vercel/link-error',
     inviteSignup: (id: string): string => `/signup/${id}`,
     onboarding: ({
@@ -156,6 +196,7 @@ export const urls = {
     asyncMigrationsFuture: (): string => '/instance/async_migrations/future',
     asyncMigrationsSettings: (): string => '/instance/async_migrations/settings',
     deadLetterQueue: (): string => '/instance/dead_letter_queue',
+    queryPerformance: (): string => '/instance/query_performance',
     materializedColumns: (): string => '/data-management/materialized-columns',
     unsubscribe: (): string => '/unsubscribe',
     integrationsRedirect: (kind: string): string => `/integrations/${kind}/callback`,
@@ -180,6 +221,7 @@ export const urls = {
     debugQuery: (query?: string | Record<string, any>): string =>
         combineUrl('/debug', {}, query ? { q: typeof query === 'string' ? query : JSON.stringify(query) } : {}).url,
     debugHog: (): string => '/debug/hog',
+
     moveToPostHogCloud: (): string => '/move-to-cloud',
     heatmaps: (params?: string): string =>
         `/heatmaps${params ? `?${params.startsWith('?') ? params.slice(1) : params}` : ''}`,
@@ -191,17 +233,40 @@ export const urls = {
     links: (params?: string): string =>
         `/links${params ? `?${params.startsWith('?') ? params.slice(1) : params}` : ''}`,
     link: (id: string): string => `/link/${id}`,
+    tracing: (): string => '/tracing',
+    metrics: (): string => '/metrics',
     sessionAttributionExplorer: (): string => '/web/session-attribution-explorer',
     sessionProfile: (id: string): string => `/sessions/${id}`,
     wizard: (): string => `/wizard`,
     coupons: (campaign: string): string => `/coupons/${campaign}`,
     startups: (referrer?: string): string => `/startups${referrer ? `/${referrer}` : ''}`,
+    agenticAuthorize: (): string => '/agentic/authorize',
     oauthAuthorize: (): string => '/oauth/authorize',
-    dataPipelines: (kind: DataPipelinesSceneTab = 'overview'): string => `/pipeline/${kind}`,
     dataPipelinesNew: (kind?: DataPipelinesNewSceneKind): string => `/pipeline/new/${kind ?? ''}`,
     dataWarehouseSource: (id: string, tab?: DataWarehouseSourceSceneTab): string =>
-        `/data-warehouse/sources/${id}/${tab ?? 'schemas'}`,
-    dataWarehouseSourceNew: (kind?: string): string => `/data-warehouse/new-source${kind ? `?kind=${kind}` : ''}`,
+        `/data-management/sources/${id}/${tab ?? 'schemas'}`,
+    dataWarehouseSourceNew: (
+        kind?: string,
+        returnUrl?: string,
+        returnLabel?: string,
+        accessMethod?: 'warehouse' | 'direct'
+    ): string => {
+        const params = new URLSearchParams()
+        if (kind) {
+            params.set('kind', kind)
+        }
+        if (returnUrl) {
+            params.set('returnUrl', returnUrl)
+        }
+        if (returnLabel) {
+            params.set('returnLabel', returnLabel)
+        }
+        if (accessMethod) {
+            params.set('access_method', accessMethod)
+        }
+        const queryString = params.toString()
+        return `/data-warehouse/new-source${queryString ? `?${queryString}` : ''}`
+    },
     batchExportNew: (service: string): string => `/pipeline/batch-exports/new/${service}`,
     batchExport: (id: string): string => `/pipeline/batch-exports/${id}`,
     legacyPlugin: (id: string): string => `/pipeline/plugins/${id}`,
@@ -211,8 +276,16 @@ export const urls = {
     productTour: (id: string, params?: string): string =>
         `/product_tours/${id}${params ? `?${params.startsWith('?') ? params.slice(1) : params}` : ''}`,
     organizationDeactivated: (): string => '/organization-deactivated',
-    approvals: (): string => '/settings/organization-approvals#change-requests',
+    approvals: (): string => '/settings/environment-approvals#change-requests',
     approval: (id: string): string => `/approvals/${id}`,
+    health: (): string => '/health',
+    healthCategory: (category: string): string => `/health/${category}`,
+    inbox: (reportId?: string): string => `/inbox${reportId ? `/${reportId}` : ''}`,
+    webAnalyticsHealth: (): string => '/web/health',
+    pipelineStatus: (): string => '/health/pipeline-status',
+    sdkDoctor: (): string => '/health/sdk-doctor',
+    exports: (): string => '/exports',
+    subscriptions: (): string => '/subscriptions',
 }
 
 export interface UrlMatcher {

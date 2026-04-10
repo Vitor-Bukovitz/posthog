@@ -26,6 +26,7 @@ import {
 import { sanitizeString } from '~/utils/db/utils'
 import { isTestEnv } from '~/utils/env-utils'
 import { parseJSON } from '~/utils/json-parse'
+import { normalizeSessionId } from '~/utils/utils'
 
 import { defaultConfig } from '../config/config'
 import { logger } from '../utils/logger'
@@ -70,6 +71,45 @@ const consumedBatchBackpressureDuration = new Histogram({
     help: 'Time spent waiting for background work to finish due to backpressure',
     labelNames: ['topic', 'groupId'],
 })
+
+const counterBackgroundTaskTimeout = new Counter({
+    name: 'consumer_background_task_timeout_total',
+    help: 'Count of background tasks that hit the timeout',
+    labelNames: ['topic', 'groupId'],
+})
+
+/**
+ * Wraps a background task promise with a timeout. When the timeout fires:
+ * - Always logs an error and increments a counter (probe phase)
+ * - Optionally force-resolves the wrapper to unblock the offset commit chain
+ *
+ * If both the timeout and the real task resolve, the second resolve() is a no-op
+ * (standard Promise behavior - a promise can only be resolved once).
+ */
+export function withBackgroundTaskTimeout(
+    task: Promise<any>,
+    timeoutMs: number,
+    forceResolve: boolean,
+    labels: { topic: string; groupId: string }
+): Promise<void> {
+    return new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+            logger.error('🔥', 'background_task_timeout', {
+                ...labels,
+                timeoutMs,
+                forceResolve,
+            })
+            counterBackgroundTaskTimeout.inc(labels)
+            if (forceResolve) {
+                resolve()
+            }
+        }, timeoutMs)
+        void task.finally(() => {
+            clearTimeout(timer)
+            resolve()
+        })
+    })
+}
 
 const gaugeBatchUtilization = new Gauge({
     name: 'consumer_batch_utilization',
@@ -725,8 +765,16 @@ export class KafkaConsumer {
                     // TRICKY: The commit logic needs to be aware of background work. If we were to just store offsets here,
                     // it would be hard to mix background work with non-background work.
                     // So we just create pretend work to simplify the rest of the logic
-                    const backgroundTask = result?.backgroundTask ?? Promise.resolve()
-                    const stopBackgroundTaskTimer = result?.backgroundTask
+                    const rawBackgroundTask = result?.backgroundTask
+                    const backgroundTask = rawBackgroundTask
+                        ? withBackgroundTaskTimeout(
+                              rawBackgroundTask,
+                              defaultConfig.CONSUMER_BACKGROUND_TASK_TIMEOUT_MS,
+                              defaultConfig.CONSUMER_BACKGROUND_TASK_TIMEOUT_FORCE_RESOLVE,
+                              { topic, groupId }
+                          )
+                        : Promise.resolve()
+                    const stopBackgroundTaskTimer = rawBackgroundTask
                         ? consumedBatchBackgroundDuration.startTimer({
                               topic: this.config.topic,
                               groupId: this.config.groupId,
@@ -785,6 +833,13 @@ export class KafkaConsumer {
                 // Once we are stopping, make sure that we wait for all background work to finish
                 await Promise.all(this.backgroundTask.map((t) => t.promise))
             } catch (error) {
+                logger.error('🔁', 'main_loop_error', {
+                    error: String(error),
+                    errorCode: (error as any)?.code,
+                    errorOrigin: (error as any)?.origin,
+                    isFatal: (error as any)?.isFatal,
+                    isRetriable: (error as any)?.isRetriable,
+                })
                 throw error
             } finally {
                 logger.info('🔁', 'main_loop_stopping')
@@ -800,6 +855,10 @@ export class KafkaConsumer {
         this.consumerLoop = startConsuming().catch((error) => {
             logger.error('🔁', 'consumer_loop_error', {
                 error: String(error),
+                errorCode: (error as any)?.code,
+                errorOrigin: (error as any)?.origin,
+                isFatal: (error as any)?.isFatal,
+                isRetriable: (error as any)?.isRetriable,
                 config: this.config,
                 consumerConfig: this.consumerConfig,
             })
@@ -828,6 +887,10 @@ export class KafkaConsumer {
             await this.consumerLoop.catch((error) => {
                 logger.error('🔁', 'failed to stop consumer loop safely. Continuing shutdown', {
                     error: String(error),
+                    errorCode: (error as any)?.code,
+                    errorOrigin: (error as any)?.origin,
+                    isFatal: (error as any)?.isFatal,
+                    isRetriable: (error as any)?.isRetriable,
                     config: this.config,
                     consumerConfig: this.consumerConfig,
                 })
@@ -883,7 +946,7 @@ export const parseEventHeaders = (headers?: MessageHeader[]): EventHeaders => {
             } else if (key === 'distinct_id') {
                 result.distinct_id = sanitizeString(value)
             } else if (key === 'session_id') {
-                result.session_id = sanitizeString(value)
+                result.session_id = normalizeSessionId(sanitizeString(value))
             } else if (key === 'timestamp') {
                 result.timestamp = value
             } else if (key === 'event') {

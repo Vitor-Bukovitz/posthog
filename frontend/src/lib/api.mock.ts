@@ -8,6 +8,7 @@ import {
     CohortType,
     DataColorThemeModel,
     ExperimentStatsMethod,
+    ExperimentVelocityStats,
     FilterLogicalOperator,
     GroupType,
     OrganizationInviteType,
@@ -51,7 +52,7 @@ export const MOCK_DEFAULT_TEAM: TeamType = {
     api_token: 'default-team-api-token',
     secret_api_token: 'phs_default-team-secret-api-token',
     secret_api_token_backup: 'phs_default-team-secret-api-token-backup',
-    app_urls: ['https://posthog.com/', 'https://app.posthog.com', 'https://example.com'],
+    app_urls: ['https://posthog.com/', 'https://app.posthog.com', 'https://example.com', 'http://127.0.0.1:*'],
     recording_domains: ['https://recordings.posthog.com/'],
     name: 'MockHog App + Marketing',
     slack_incoming_webhook: '',
@@ -265,7 +266,9 @@ export const MOCK_DEFAULT_USER: UserType = {
         project_weekly_digest_disabled: {},
         all_weekly_digest_disabled: false,
         error_tracking_issue_assigned: false,
+        error_tracking_weekly_digest: true,
         discussions_mentioned: false,
+        organization_member_join_email_disabled: {},
     },
     anonymize_data: false,
     allow_impersonation: true,
@@ -457,3 +460,11 @@ export const MOCK_DATA_COLOR_THEMES: DataColorThemeModel[] = [
         is_global: false,
     },
 ]
+
+export const MOCK_EXPERIMENTS_STATS_RESPONSE: ExperimentVelocityStats = {
+    launched_last_30d: 0,
+    launched_previous_30d: 0,
+    percent_change: 0,
+    active_experiments: 0,
+    completed_last_30d: 0,
+}

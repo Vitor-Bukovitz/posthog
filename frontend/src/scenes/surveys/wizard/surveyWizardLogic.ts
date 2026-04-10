@@ -1,15 +1,25 @@
 import { actions, afterMount, connect, kea, key, listeners, path, props, reducers, selectors } from 'kea'
-import { router } from 'kea-router'
+import { router, urlToAction } from 'kea-router'
 
 import { lemonToast } from '@posthog/lemon-ui'
 
 import api from 'lib/api'
+import { dayjs } from 'lib/dayjs'
 import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
+import { Scene } from 'scenes/sceneTypes'
+import { teamLogic } from 'scenes/teamLogic'
 import { urls } from 'scenes/urls'
 
-import { LinkSurveyQuestion, Survey, SurveyQuestionType, SurveySchedule, SurveyType } from '~/types'
+import { ProductIntentContext, ProductKey } from '~/queries/schema/schema-general'
+import { Breadcrumb, LinkSurveyQuestion, Survey, SurveyQuestionType, SurveySchedule, SurveyType } from '~/types'
 
-import { SurveyTemplate, defaultSurveyAppearance, defaultSurveyTemplates, surveyThemes } from '../constants'
+import {
+    SURVEY_CREATED_SOURCE,
+    SurveyTemplate,
+    defaultSurveyAppearance,
+    defaultSurveyTemplates,
+    surveyThemes,
+} from '../constants'
 import { surveyLogic } from '../surveyLogic'
 import { surveysLogic } from '../surveysLogic'
 import type { surveyWizardLogicType } from './surveyWizardLogicType'
@@ -45,9 +55,16 @@ export const surveyWizardLogic = kea<surveyWizardLogicType>([
             surveysLogic,
             ['loadSurveys'],
             eventUsageLogic,
-            ['reportSurveyCreated', 'reportSurveyEdited'],
+            ['reportSurveyCreated', 'reportSurveyEdited', 'reportSurveyTemplateClicked'],
+            teamLogic,
+            ['addProductIntent'],
         ],
-        values: [surveyLogic({ id: props.id }), ['survey', 'surveyLoading']],
+        values: [
+            surveyLogic({ id: props.id }),
+            ['survey', 'surveyChanged', 'surveyLoading'],
+            teamLogic,
+            ['currentTeam'],
+        ],
     })),
 
     actions({
@@ -83,7 +100,7 @@ export const surveyWizardLogic = kea<surveyWizardLogicType>([
                     return WIZARD_STEPS[Math.max(currentIndex - 1, 0)]
                 },
                 resetWizard: () => (props.id === 'new' ? 'template' : 'questions'),
-                selectTemplate: () => 'questions', // Move to questions after selecting template
+                selectTemplate: () => 'questions',
             },
         ],
         selectedTemplate: [
@@ -135,13 +152,22 @@ export const surveyWizardLogic = kea<surveyWizardLogicType>([
                 return defaultSurveyTemplates.filter((t) => !CORE_TEMPLATE_TYPES.includes(t.templateType))
             },
         ],
-        stepNumber: [
-            (s) => [s.currentStep],
-            (currentStep: WizardStep): number => {
-                const index = WIZARD_STEPS.indexOf(currentStep)
-                // Template step is step 0, so questions is step 1
-                return index
-            },
+        stepNumber: [(s) => [s.currentStep], (currentStep: WizardStep): number => WIZARD_STEPS.indexOf(currentStep)],
+        breadcrumbs: [
+            (s) => [s.survey],
+            (survey: Survey): Breadcrumb[] => [
+                {
+                    key: Scene.Surveys,
+                    name: 'Surveys',
+                    path: urls.surveys(),
+                    iconType: 'survey',
+                },
+                {
+                    key: [Scene.SurveyWizard, survey?.id || 'new'],
+                    name: survey?.name || 'New survey',
+                    iconType: 'survey',
+                },
+            ],
         ],
         stepValidationErrors: [
             (s) => [s.survey],
@@ -196,7 +222,12 @@ export const surveyWizardLogic = kea<surveyWizardLogicType>([
                         reason: 'Transactional surveys can be more frequent',
                     }
                 }
-                if (templateType?.includes('Onboarding') || templateType?.includes('Attribution')) {
+                if (
+                    templateType?.includes('Onboarding') ||
+                    templateType?.includes('Attribution') ||
+                    templateType?.includes('Exit') ||
+                    templateType?.includes('Announcement')
+                ) {
                     return { value: 'once', label: 'Once ever', reason: 'One-time feedback collection' }
                 }
                 return { value: 'monthly', label: 'Every month', reason: 'General feedback cadence' }
@@ -206,8 +237,7 @@ export const surveyWizardLogic = kea<surveyWizardLogicType>([
 
     listeners(({ actions, values, props }) => ({
         selectTemplate: ({ template }) => {
-            // Initialize survey with selected template
-            const timestamp = new Date().toISOString().slice(0, 16).replace('T', ' ')
+            const timestamp = dayjs().format('YYYY-MM-DD HH:mm')
             actions.setSurveyValue('name', `${template.templateType} (${timestamp})`)
             actions.setSurveyValue('description', template.description || '')
             actions.setSurveyValue('type', template.type || SurveyType.Popover)
@@ -237,33 +267,24 @@ export const surveyWizardLogic = kea<surveyWizardLogicType>([
             actions.setSurveyValue('appearance', {
                 ...defaultSurveyAppearance,
                 ...themeAppearance,
+                ...values.currentTeam?.survey_config?.appearance,
                 ...cleanTemplateBehavior,
             })
 
-            // Set frequency based on template type, but preserve other conditions from template
             const frequencyToDays: Record<string, number | undefined> = {
                 once: undefined,
                 yearly: 365,
                 quarterly: 90,
                 monthly: 30,
             }
-            const templateType = template.templateType
-            let frequencyValue = 'monthly'
-            if (templateType.includes('NPS') || templateType.includes('PMF')) {
-                frequencyValue = 'quarterly'
-            } else if (templateType.includes('CSAT') || templateType.includes('CES')) {
-                frequencyValue = 'monthly'
-            } else if (templateType.includes('Onboarding') || templateType.includes('Attribution')) {
-                frequencyValue = 'once'
-            }
-
-            const isOnce = frequencyValue === 'once'
-            actions.setSurveyValue('schedule', isOnce ? SurveySchedule.Once : SurveySchedule.Always)
-            // Preserve existing template conditions (e.g. event triggers) and only update frequency
+            const { value: frequencyValue } = values.recommendedFrequency
+            actions.setSurveyValue('schedule', frequencyValue === 'once' ? SurveySchedule.Once : SurveySchedule.Always)
             actions.setSurveyValue('conditions', {
                 ...template.conditions,
                 seenSurveyWaitPeriodInDays: frequencyToDays[frequencyValue],
             })
+
+            actions.reportSurveyTemplateClicked(template.templateType, SURVEY_CREATED_SOURCE.SURVEY_WIZARD)
         },
         restoreDefaultQuestions: () => {
             const template = values.selectedTemplate
@@ -289,15 +310,27 @@ export const surveyWizardLogic = kea<surveyWizardLogicType>([
             lemonToast.success(`Survey ${survey.name} created`)
             actions.loadSurveys()
             actions.reportSurveyCreated(survey, false, 'wizard')
+            actions.addProductIntent({
+                product_type: ProductKey.SURVEYS,
+                intent_context: ProductIntentContext.SURVEY_CREATED,
+                metadata: {
+                    survey_id: survey.id,
+                    source: SURVEY_CREATED_SOURCE.SURVEY_WIZARD,
+                },
+            })
+            actions.addProductIntent({
+                product_type: ProductKey.SURVEYS,
+                intent_context: ProductIntentContext.SURVEY_LAUNCHED,
+                metadata: {
+                    survey_id: survey.id,
+                    source: SURVEY_CREATED_SOURCE.SURVEY_WIZARD,
+                },
+            })
             actions.setStep('success')
         },
         saveDraft: async () => {
             try {
-                const surveyData = {
-                    ...values.survey,
-                    // Don't set start_date - keep as draft
-                }
-                const createdSurvey = await api.surveys.create(surveyData)
+                const createdSurvey = await api.surveys.create(values.survey)
                 actions.saveDraftSuccess(createdSurvey)
             } catch (e) {
                 actions.saveDraftFailure(String(e))
@@ -308,12 +341,19 @@ export const surveyWizardLogic = kea<surveyWizardLogicType>([
             lemonToast.success(`Survey "${survey.name}" saved as draft`)
             actions.loadSurveys()
             actions.reportSurveyCreated(survey, false, 'wizard')
+            actions.addProductIntent({
+                product_type: ProductKey.SURVEYS,
+                intent_context: ProductIntentContext.SURVEY_CREATED,
+                metadata: {
+                    survey_id: survey.id,
+                    source: SURVEY_CREATED_SOURCE.SURVEY_WIZARD,
+                },
+            })
             router.actions.push(urls.survey(survey.id))
         },
         updateSurvey: async () => {
             try {
-                const surveyData = values.survey
-                const updatedSurvey = await api.surveys.update(props.id, surveyData)
+                const updatedSurvey = await api.surveys.update(props.id, values.survey)
                 actions.updateSurveySuccess(updatedSurvey)
             } catch (e) {
                 actions.updateSurveyFailure(String(e))
@@ -328,26 +368,46 @@ export const surveyWizardLogic = kea<surveyWizardLogicType>([
         },
     })),
 
+    urlToAction(({ actions, props }) => ({
+        [urls.surveyWizard(props.id)]: (_, searchParams) => {
+            const templateParam = searchParams.template
+            if (templateParam && props.id === 'new') {
+                const matchedTemplate = defaultSurveyTemplates.find((t) => t.templateType === templateParam)
+                if (matchedTemplate) {
+                    actions.resetSurvey()
+                    actions.selectTemplate(matchedTemplate)
+                }
+            }
+        },
+    })),
+
     afterMount(({ actions, props, values }) => {
+        const shouldPreserveLocalChanges =
+            router.values.hashParams.preserveLocalChanges && values.surveyChanged && values.survey.id === props.id
+
         if (props.id === 'new') {
-            // Check if survey already has a template selected (from SurveyTemplates page)
+            if (shouldPreserveLocalChanges) {
+                actions.setStep('questions')
+                return
+            }
+
             // Templates set both name AND questions, while default NEW_SURVEY has empty name
             const hasTemplateSelected = values.survey?.name && values.survey?.questions?.length > 0
             if (hasTemplateSelected) {
-                // Skip template step, go directly to questions
                 actions.setStep('questions')
             } else {
-                // Reset wizard and survey state for new survey
                 actions.resetWizard()
                 actions.resetSurvey()
             }
-        } else {
-            // Load existing survey data
+        } else if (!shouldPreserveLocalChanges) {
             actions.loadSurvey()
         }
 
         return () => {
             actions.resetWizard()
+            if (props.id === 'new') {
+                actions.resetSurvey()
+            }
         }
     }),
 ])

@@ -8,9 +8,9 @@ import pytz
 from posthog.schema import HogQLQuery
 
 from posthog.clickhouse.client import sync_execute
-from posthog.clickhouse.query_tagging import Product, tag_queries
+from posthog.clickhouse.query_tagging import Feature, Product, tag_queries
 from posthog.models.team import Team
-from posthog.session_recordings.models.metadata import RecordingBlockListing, RecordingMetadata
+from posthog.session_recordings.models.metadata import RecordingMetadata
 
 DEFAULT_EVENT_FIELDS = [
     "event",
@@ -33,7 +33,7 @@ def seconds_until_midnight():
 
 class SessionReplayEvents:
     def exists(self, session_id: str, team: Team) -> bool:
-        cache_key = f"summarize_recording_existence_team_{team.pk}_id_{session_id}"
+        cache_key = f"session_recording_existence_team_{team.pk}_id_{session_id}"
         cached_response = cache.get(cache_key)
         if isinstance(cached_response, bool):
             return cached_response
@@ -48,9 +48,53 @@ class SessionReplayEvents:
             cache.set(cache_key, existence, timeout=seconds_until_midnight())
         return existence
 
+    def batch_exists(self, session_ids: list[str], team: Team) -> dict[str, bool]:
+        """
+        Check which session IDs have recordings within retention period.
+        Returns a dict mapping session_id -> exists (boolean).
+        Only positive results (exists=True) are cached.
+        """
+        if not session_ids:
+            return {}
+
+        results: dict[str, bool] = {}
+        uncached_session_ids: list[str] = []
+
+        # Check cache first
+        for sid in session_ids:
+            cache_key = f"session_recording_existence_team_{team.pk}_id_{sid}"
+            cached_value = cache.get(cache_key)
+            if cached_value is True:
+                results[sid] = True
+            else:
+                uncached_session_ids.append(sid)
+
+        if not uncached_session_ids:
+            return results
+
+        # Query ClickHouse for uncached session IDs
+        found_sessions = self._find_with_timestamps(uncached_session_ids, team)
+        # Build a mapping from session_id to expiry_time (tuple is: session_id, min_ts, max_ts, expiry_time)
+        session_expiry_map = {session_id: expiry_time for session_id, _, _, expiry_time in found_sessions}
+
+        now = datetime.now(pytz.timezone("UTC"))
+
+        # Build results and cache positive results with expiry-based TTL
+        for sid in uncached_session_ids:
+            exists = sid in session_expiry_map
+            results[sid] = exists
+            if exists:
+                expiry_time = session_expiry_map[sid]
+                ttl_seconds = int((expiry_time - now).total_seconds())
+                if ttl_seconds > 0:
+                    cache_key = f"session_recording_existence_team_{team.pk}_id_{sid}"
+                    cache.set(cache_key, True, timeout=ttl_seconds)
+
+        return results
+
     @staticmethod
     def _check_exists(session_id: str, team: Team) -> bool:
-        tag_queries(product=Product.REPLAY, team_id=team.pk)
+        tag_queries(product=Product.REPLAY, feature=Feature.QUERY, team_id=team.pk)
         result = sync_execute(
             """
             SELECT
@@ -68,6 +112,7 @@ class SessionReplayEvents:
                 session_id
             HAVING
                 expiry_time >= %(python_now)s
+                AND max(is_deleted) = 0
             """,
             {
                 "team_id": team.pk,
@@ -93,27 +138,27 @@ class SessionReplayEvents:
         if not found_sessions:
             return set(), None, None
         # Calculate min/max timestamps for the entire list of sessions
-        replay_session_ids = [session_id for session_id, _, _ in found_sessions]
-        min_timestamp = min(ts for _, ts, _ in found_sessions)
-        max_timestamp = max(ts for _, _, ts in found_sessions)
+        replay_session_ids = [session_id for session_id, _, _, _ in found_sessions]
+        min_timestamp = min(ts for _, ts, _, _ in found_sessions)
+        max_timestamp = max(ts for _, _, ts, _ in found_sessions)
         # Check which sessions also have events in the events table
         sessions_with_events = self._find_sessions_in_events(replay_session_ids, min_timestamp, max_timestamp, team)
         if not sessions_with_events:
             return set(), None, None
         # Filter to only sessions that exist in both tables
-        session_ids_found = {session_id for session_id, _, _ in found_sessions if session_id in sessions_with_events}
+        session_ids_found = {session_id for session_id, _, _, _ in found_sessions if session_id in sessions_with_events}
         if not session_ids_found:
             return set(), None, None
         # Recalculate timestamps for filtered sessions only
-        min_timestamp = min(ts for session_id, ts, _ in found_sessions if session_id in session_ids_found)
-        max_timestamp = max(ts for session_id, _, ts in found_sessions if session_id in session_ids_found)
+        min_timestamp = min(ts for session_id, ts, _, _ in found_sessions if session_id in session_ids_found)
+        max_timestamp = max(ts for session_id, _, ts, _ in found_sessions if session_id in session_ids_found)
         return session_ids_found, min_timestamp, max_timestamp
 
     @staticmethod
-    def _find_with_timestamps(session_ids: list[str], team: Team) -> list[tuple[str, datetime, datetime]]:
+    def _find_with_timestamps(session_ids: list[str], team: Team) -> list[tuple[str, datetime, datetime, datetime]]:
         """
         Check which session IDs exist in session_replay_events within retention period.
-        Returns a list of tuples of (session_id, min_timestamp, max_timestamp).
+        Returns a list of tuples of (session_id, min_timestamp, max_timestamp, expiry_time).
         Timestamps are per session, not for the entire list of sessions.
         """
         from posthog.hogql_queries.hogql_query_runner import HogQLQueryRunner
@@ -136,17 +181,20 @@ class SessionReplayEvents:
                     session_id
                 HAVING
                     expiry_time >= {now}
+                    AND max(is_deleted) = 0
             """,
             values={
                 "session_ids": session_ids,
                 "now": now,
             },
         )
-        tag_queries(product=Product.REPLAY, team_id=team.pk)
+        tag_queries(product=Product.REPLAY, feature=Feature.QUERY, team_id=team.pk)
         result = HogQLQueryRunner(team=team, query=query).calculate()
         if not result.results:
             return []
-        sessions_found: list[tuple[str, datetime, datetime]] = [(row[0], row[1], row[2]) for row in result.results]
+        sessions_found: list[tuple[str, datetime, datetime, datetime]] = [
+            (row[0], row[1], row[2], row[4]) for row in result.results
+        ]
         return sessions_found
 
     @staticmethod
@@ -173,7 +221,7 @@ class SessionReplayEvents:
                 "max_timestamp": max_timestamp,
             },
         )
-        tag_queries(product=Product.REPLAY, team_id=team.pk)
+        tag_queries(product=Product.REPLAY, feature=Feature.QUERY, team_id=team.pk)
         result = HogQLQueryRunner(team=team, query=query).calculate()
         if not result.results:
             return set()
@@ -222,46 +270,9 @@ class SessionReplayEvents:
                 session_id
             HAVING
                 expiry_time >= %(python_now)s
+                AND max(is_deleted) = 0
             {optional_format_clause}
         """
-        query = query.format(
-            optional_timestamp_clause=(
-                "AND min_first_timestamp >= %(recording_start_time)s" if recording_start_time else ""
-            ),
-            optional_format_clause=(f"FORMAT {format}" if format else ""),
-        )
-        return query
-
-    @staticmethod
-    def get_block_listing_query(
-        recording_start_time: Optional[datetime] = None,
-        format: Optional[str] = None,
-    ) -> LiteralString:
-        """
-        Helper function to build a query for session metadata, to be able to use
-        both in production and locally (for example, when testing session summary)
-        """
-        query = """
-                SELECT
-                    min(min_first_timestamp) as start_time,
-                    groupArrayArray(block_first_timestamps) as block_first_timestamps,
-                    groupArrayArray(block_last_timestamps) as block_last_timestamps,
-                    groupArrayArray(block_urls) as block_urls,
-                    max(retention_period_days) as retention_period_days,
-                    dateTrunc('DAY', start_time) + toIntervalDay(coalesce(retention_period_days, 30)) as expiry_time
-                FROM
-                    session_replay_events
-                PREWHERE
-                    team_id = %(team_id)s
-                    AND session_id = %(session_id)s
-                    AND min_first_timestamp <= %(python_now)s
-                    {optional_timestamp_clause}
-                GROUP BY
-                    session_id
-                HAVING
-                    expiry_time >= %(python_now)s
-                {optional_format_clause}
-                """
         query = query.format(
             optional_timestamp_clause=(
                 "AND min_first_timestamp >= %(recording_start_time)s" if recording_start_time else ""
@@ -307,7 +318,7 @@ class SessionReplayEvents:
         recording_start_time: Optional[datetime] = None,
     ) -> Optional[RecordingMetadata]:
         query = self.get_metadata_query(recording_start_time)
-        tag_queries(product=Product.REPLAY, team_id=team.pk)
+        tag_queries(product=Product.REPLAY, feature=Feature.QUERY, team_id=team.pk)
         replay_response: list[tuple] = sync_execute(
             query,
             {
@@ -376,8 +387,9 @@ class SessionReplayEvents:
                 session_id
             HAVING
                 expiry_time >= %(python_now)s
+                AND max(is_deleted) = 0
         """
-        tag_queries(product=Product.REPLAY, team_id=team.pk)
+        tag_queries(product=Product.REPLAY, feature=Feature.QUERY, team_id=team.pk)
         replay_response: list[tuple] = sync_execute(
             query,
             {
@@ -396,42 +408,6 @@ class SessionReplayEvents:
             if metadata:
                 result[session_id] = metadata
         return result
-
-    @staticmethod
-    def build_recording_block_listing(session_id: str, replay_response: list[tuple]) -> Optional[RecordingBlockListing]:
-        if len(replay_response) == 0:
-            return None
-        if len(replay_response) > 1:
-            raise ValueError("Multiple sessions found for session_id: {}".format(session_id))
-
-        replay = replay_response[0]
-
-        return RecordingBlockListing(
-            start_time=replay[0],
-            block_first_timestamps=replay[1],
-            block_last_timestamps=replay[2],
-            block_urls=replay[3],
-        )
-
-    def list_blocks(
-        self,
-        session_id: str,
-        team: Team,
-        recording_start_time: Optional[datetime] = None,
-    ) -> Optional[RecordingBlockListing]:
-        query = self.get_block_listing_query(recording_start_time)
-        tag_queries(product=Product.REPLAY, team_id=team.pk)
-        replay_response: list[tuple] = sync_execute(
-            query,
-            {
-                "team_id": team.pk,
-                "session_id": session_id,
-                "recording_start_time": recording_start_time,
-                "python_now": datetime.now(pytz.timezone("UTC")),
-            },
-        )
-        recording_metadata = self.build_recording_block_listing(session_id, replay_response)
-        return recording_metadata
 
     def get_events_query(
         self,
@@ -497,7 +473,7 @@ class SessionReplayEvents:
         from posthog.hogql_queries.hogql_query_runner import HogQLQueryRunner
 
         hq = self.get_events_query(session_id, metadata, events_to_ignore, extra_fields, limit, page)
-        tag_queries(product=Product.REPLAY, team_id=team.pk)
+        tag_queries(product=Product.REPLAY, feature=Feature.QUERY, team_id=team.pk)
         result: HogQLQueryResponse = HogQLQueryRunner(
             team=team,
             query=hq,
@@ -507,11 +483,15 @@ class SessionReplayEvents:
     @staticmethod
     def get_sessions_from_distinct_id_query(
         format: Optional[str] = None,
+        paginated: bool = False,
     ):
         """
-        Helper function to build a query for listing all session IDs for a given set of distinct IDs
+        Helper function to build a query for listing all session IDs for a given set of distinct IDs.
+        When paginated=True, adds keyset pagination (cursor, page_size parameters required).
         """
-        query = """
+        cursor_clause = "AND session_id > %(cursor)s" if paginated else ""
+        pagination_clause = "ORDER BY session_id ASC LIMIT %(page_size)s" if paginated else ""
+        query = f"""
                 SELECT
                     session_id,
                     min(min_first_timestamp) as start_time,
@@ -521,13 +501,16 @@ class SessionReplayEvents:
                     session_replay_events
                 PREWHERE
                     team_id = %(team_id)s
-                    AND distinct_id IN (%(distinct_ids)s)
                     AND min_first_timestamp <= %(python_now)s
+                    {cursor_clause}
                 GROUP BY
                     session_id
                 HAVING
                     expiry_time >= %(python_now)s
-                {optional_format_clause}
+                    AND max(is_deleted) = 0
+                    AND anyIf(distinct_id, notEmpty(distinct_id)) IN (%(distinct_ids)s)
+                {pagination_clause}
+                {{optional_format_clause}}
                 """
         query = query.format(
             optional_format_clause=(f"FORMAT {format}" if format else ""),
@@ -537,11 +520,15 @@ class SessionReplayEvents:
     @staticmethod
     def get_sessions_from_team_id_query(
         format: Optional[str] = None,
+        paginated: bool = False,
     ):
         """
-        Helper function to build a query for listing all session IDs for a given team ID
+        Helper function to build a query for listing all session IDs for a given team ID.
+        When paginated=True, adds keyset pagination (cursor, page_size parameters required).
         """
-        query = """
+        cursor_clause = "AND session_id > %(cursor)s" if paginated else ""
+        pagination_clause = "ORDER BY session_id ASC LIMIT %(page_size)s" if paginated else ""
+        query = f"""
                 SELECT
                     session_id,
                     min(min_first_timestamp) as start_time,
@@ -552,11 +539,14 @@ class SessionReplayEvents:
                 PREWHERE
                     team_id = %(team_id)s
                     AND min_first_timestamp <= %(python_now)s
+                    {cursor_clause}
                 GROUP BY
                     session_id
                 HAVING
                     expiry_time >= %(python_now)s
-                {optional_format_clause}
+                    AND max(is_deleted) = 0
+                {pagination_clause}
+                {{optional_format_clause}}
                 """
         query = query.format(
             optional_format_clause=(f"FORMAT {format}" if format else ""),
@@ -640,7 +630,7 @@ def get_person_emails_for_session_ids(
             "max_timestamp": max_timestamp,
         },
     )
-    tag_queries(product=Product.REPLAY, team_id=team_id)
+    tag_queries(product=Product.REPLAY, feature=Feature.QUERY, team_id=team_id)
     result = HogQLQueryRunner(team=team, query=query).calculate()
     email_mapping: dict[str, str | None] = dict.fromkeys(session_ids)
     if result.results:
